@@ -1,5 +1,9 @@
 # fmail
 
+<p align="center">
+  <img src="docs/fmail.svg" alt="fmail — secure terminal mail" width="720">
+</p>
+
 A fast, keyboard-driven **terminal email client** — command line **and** full-screen
 TUI — with built-in **end-to-end encryption** (OpenPGP/Autocrypt), an **encrypted
 vault** for your passwords and address book, and a **local cache** for instant,

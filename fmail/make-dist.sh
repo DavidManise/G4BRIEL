@@ -27,6 +27,8 @@ copy() { if [ -f "$1" ]; then cp "$1" "$OUT/"; echo "  + $1"; fi; }
 
 echo "Assembling $OUT/ (whitelist only) ..."
 for f in "${APP[@]}" "${DOCS[@]}" "${TESTS[@]}" "${OPT[@]}"; do copy "$f"; done
+# doc assets (preserve the docs/ path so README's image link resolves)
+if [ -f docs/fmail.svg ]; then mkdir -p "$OUT/docs"; cp docs/fmail.svg "$OUT/docs/"; echo "  + docs/fmail.svg"; fi
 
 # abort if any secret slipped in
 for pat in "${SECRET_GLOBS[@]}"; do
