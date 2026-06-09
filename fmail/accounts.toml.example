@@ -1,0 +1,63 @@
+# fmail configuration.
+#
+# On first launch, fmail runs a small setup wizard (language → add an account →
+# optional encryption), so you normally don't need to edit this file by hand.
+# But you can: uncomment a block below and adapt it.
+#
+# Put each account's password in a file with mode 600 under ~/secrets/ :
+#     install -m 600 /dev/null ~/secrets/perso_mail_password
+#     nano ~/secrets/perso_mail_password    # paste the password
+# …or store it in the encrypted vault instead:  fmail vault set-password perso
+
+# ── A mail account (uncomment and adapt; add as many [accounts.<name>] as you like) ──
+# [accounts.perso]
+# email = "me@example.com"
+# display_name = "Your Name"
+# imap_host = "imap.example.com"
+# imap_port = 993
+# smtp_host = "smtp.example.com"
+# smtp_port = 465
+# password_file = "~/secrets/perso_mail_password"
+# # Leave empty = auto-detect via the IMAP \Sent \Archive \Trash flags:
+# sent_folder = ""
+# archive_folder = ""
+# trash_folder = ""
+#
+# default = "perso"   # which account is used when none is given on the CLI
+#
+# Gmail: enable 2-step verification then create an "app password".
+# IMAP imap.gmail.com:993, SMTP smtp.gmail.com:465. Gmail folders live under
+# "[Gmail]/..." → auto-detection finds them.
+
+# ── Interface language (chosen on first launch; uncomment to force it) ──
+# [ui]
+#   lang   = "auto"   detect from your system locale (LANG/LC_*), English fallback
+#                     ("en" forces English, "fr" forces French)
+#   splash = true     show the ASCII logo at launch (false to skip it)
+#   background = "dark"      force a black canvas so the palette is readable on ANY
+#                            terminal (recommended). "terminal" = keep your own bg.
+# [ui]
+# lang = "auto"
+# splash = true
+# background = "dark"
+
+# ── Encrypted vault + master password (offered on first launch; ALL optional) ──
+# The vault (vault.gpg, gpg --symmetric AES-256) encrypts the account passwords AND
+# the address book under a MASTER PASSWORD. Without it, the local cache (mail
+# subjects + bodies) and passwords are stored UNENCRYPTED on this machine.
+#
+# Setup:
+#   fmail vault init            # create the vault + import passwords from ~/secrets
+#   fmail vault purge-secrets   # once it works: delete the CLEARTEXT passwords
+#   fmail vault set-password X  # add/update an account password in the vault
+#   fmail vault passwd          # change the master password
+#
+# ⚠ FORGOTTEN master password = vault IRRECOVERABLE (keep the recovery code!).
+# With encrypt_cache (default), the local cache (.fmail_cache.db.gpg) is encrypted
+# at rest and decrypted ONLY in RAM (tmpfs /dev/shm) during the session.
+#
+# [security]
+# master_password = true     # require the master password at launch
+# lock_timeout = 900         # auto-lock after N seconds of inactivity (0 = never)
+# address_book = true        # encrypted address book (key C in the TUI)
+# encrypt_cache = true       # local cache encrypted at rest (decrypted in RAM only)

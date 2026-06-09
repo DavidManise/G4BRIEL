@@ -1,0 +1,22 @@
+# fmail runtime data & secrets — NEVER commit
+accounts.toml
+*.gpg
+*.gpg.lock
+sent.log
+check.log
+notified_uids.txt
+.autocrypt.db
+.tls_pins.json
+.fmail_cache.db*
+.gnupg-*/
+secrets/
+signatures/
+drafts/
+# build artifacts / scratch
+dist/
+*.tar.gz
+__pycache__/
+*.pyc
+*.bak*
+_i18n_backup_*/
+SHA256SUMS
