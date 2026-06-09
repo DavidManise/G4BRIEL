@@ -51,6 +51,10 @@
 #   fmail vault purge-secrets   # once it works: delete the CLEARTEXT passwords
 #   fmail vault set-password X  # add/update an account password in the vault
 #   fmail vault passwd          # change the master password
+#   fmail vault duress          # OPTIONAL panic password: if entered at launch, it
+#                               # destroys all local data (vault, keys, cache, accounts,
+#                               # passwords) behind a fake network-error screen. Must
+#                               # differ from the master password & recovery code.
 #
 # ⚠ FORGOTTEN master password = vault IRRECOVERABLE (keep the recovery code!).
 # With encrypt_cache (default), the local cache (.fmail_cache.db.gpg) is encrypted

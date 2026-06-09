@@ -12,7 +12,7 @@ offline-friendly browsing of your whole mailbox.
 Written in plain Python (standard library only) + the system `gpg`. **No pip
 dependencies.** Runs on **Linux and macOS**.
 
-> Status: **0.9.0-beta**. Works daily, but still a beta — back up anything you
+> Status: **0.9.1-beta**. Works daily, but still a beta — back up anything you
 > care about and report rough edges.
 
 ## Install
@@ -81,7 +81,10 @@ unrecoverable).
   from incoming mail, anti-TOFU key-change protection, clear green/yellow/red trust
   markers, in-app encryption help (`Ctrl-A`).
 - **Security**: encrypted vault (master password + recovery code, scrypt-hardened),
-  TLS certificate pinning with MITM detection (fail-closed), encrypted cache at rest.
+  TLS certificate pinning with MITM detection (fail-closed), encrypted cache at rest,
+  and an optional **duress password** (`fmail vault duress`) — if you are forced to
+  reveal a password, give that one: it destroys all local data (crypto-erase + wipe)
+  behind a fake "can't reach the server" screen. Server-side mail is not touched.
 - **CLI**: `fmail list|read|reply|forward|compose|move|archive|trash|search|vault …`.
 
 Run fmail and press `m` for the full menu, or `Ctrl-A` for encryption help.

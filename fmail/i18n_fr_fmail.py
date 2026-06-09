@@ -5,6 +5,34 @@
 
 CATALOG = {
     "[encrypted]": "[chiffré]",
+    # ── In-app update ──
+    "could not check for updates: {e}": "impossible de vérifier les mises à jour : {e}",
+    "could not check for updates: empty version.":
+        "impossible de vérifier les mises à jour : version vide.",
+    "download failed: {e}": "échec du téléchargement : {e}",
+    "download failed for {name}: {e}": "échec du téléchargement de {name} : {e}",
+    "update manifest invalid (missing files).": "manifeste de mise à jour invalide (fichiers manquants).",
+    "checksum mismatch for {name} — update aborted.":
+        "empreinte incohérente pour {name} — mise à jour annulée.",
+    "cannot write the update ({e}). Check permissions on {dir}.":
+        "impossible d'écrire la mise à jour ({e}). Vérifie les permissions de {dir}.",
+    # ── Duress password (CLI) ──
+    "⚠ DURESS PASSWORD. Entering it at launch will PERMANENTLY DESTROY all "
+    "local fmail data (vault, keys, cache, accounts, passwords) behind a fake "
+    "network-error screen. It must DIFFER from the master password and the "
+    "recovery code. Leave EMPTY to disable.":
+        "⚠ MOT DE PASSE DE CONTRAINTE. Le saisir au démarrage DÉTRUIRA DÉFINITIVEMENT "
+        "toutes les données locales de fmail (coffre, clés, cache, comptes, mots de passe) "
+        "derrière un faux écran d'erreur réseau. Il doit ÊTRE DIFFÉRENT du mot de passe "
+        "maître et du code de récupération. Laisser VIDE pour le désactiver.",
+    "Duress password (empty = disable): ": "Mot de passe de contrainte (vide = désactiver) : ",
+    "✓ duress password disabled.": "✓ mot de passe de contrainte désactivé.",
+    "Confirm duress password: ": "Confirmer le mot de passe de contrainte : ",
+    "the two entries differ.": "les deux saisies diffèrent.",
+    "✓ duress password set. Entering it at launch WIPES everything "
+    "(irreversible).":
+        "✓ mot de passe de contrainte défini. Le saisir au démarrage EFFACE tout "
+        "(irréversible).",
     # ── Account / config ──
     "no password for “{name}” "
     "(vault locked? unlock it, or configure password_file).":

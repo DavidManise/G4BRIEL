@@ -241,6 +241,248 @@ def test_wizard_cannot_brick():
     assert "if self.acc is None:" in src and "_open_cache()" in src
 
 
+def test_emergency_wipe_scope():
+    """DURESS wipe: destroys THIS fmail's data + the per-account password files, but
+    NEVER the rest of ~/secrets, unrelated files, the program, or accounts.toml.example.
+    All on TEMPORARY paths (globals monkeypatched + restored)."""
+    import vault
+    import autocrypt
+    save = {
+        "cfg": fmail.CONFIG_PATH, "state": fmail.STATE_PATH, "sent": fmail.SENT_LOG,
+        "tls": fmail.TLS_PINS, "sig": fmail.SIGNATURE_DIR, "shm": fmail.SHM_DIR,
+        "vp": vault.VAULT_PATH, "vh": vault.VAULT_HOME,
+        "ah": autocrypt.AUTOCRYPT_HOME, "pdb": autocrypt.PEERS_DB,
+        "home": os.environ.get("HOME"),
+    }
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            os.environ["HOME"] = str(d)     # ~/secrets maps to the TEMP dir (safety + scope)
+            data = d / "freyja-mail"; data.mkdir()
+            secrets = d / "secrets"; secrets.mkdir()
+            (d / "shm").mkdir()
+            fmail.CONFIG_PATH = data / "accounts.toml"
+            fmail.STATE_PATH = data / ".fmail_state.json"
+            fmail.SENT_LOG = data / "sent.log"
+            fmail.TLS_PINS = data / ".tls_pins.json"
+            fmail.SIGNATURE_DIR = data / "signatures"
+            fmail.SHM_DIR = str(d / "shm")
+            vault.VAULT_PATH = data / "vault.gpg"; vault.VAULT_HOME = data / ".gnupg-vault"
+            autocrypt.AUTOCRYPT_HOME = data / ".gnupg-autocrypt"; autocrypt.PEERS_DB = data / ".autocrypt.db"
+            pwf = secrets / "dm_mail_password"; pwf.write_text("imap-secret\n")
+            fmail.CONFIG_PATH.write_text(
+                f'[accounts.dm]\nemail="a@b.c"\nimap_host="x"\npassword_file="{pwf}"\n')
+            # fmail data to be DESTROYED
+            vault.VAULT_PATH.write_bytes(b"VAULTCIPHER")
+            for dd, f in ((vault.VAULT_HOME, "trustdb.gpg"), (autocrypt.AUTOCRYPT_HOME, "secring")):
+                dd.mkdir(); (dd / f).write_bytes(b"key")
+            autocrypt.PEERS_DB.write_bytes(b"db")
+            (data / ".fmail_cache.db.gpg").write_bytes(b"cache")
+            fmail.SENT_LOG.write_text("log"); fmail.STATE_PATH.write_text("{}"); fmail.TLS_PINS.write_text("{}")
+            fmail.SIGNATURE_DIR.mkdir(); (fmail.SIGNATURE_DIR / "dm.sig").write_text("sig")
+            (data / "drafts").mkdir(); (data / "drafts" / "d1").write_text("draft")
+            (data / "notified_uids.txt").write_text("1")
+            (d / "shm" / f"fmail-cache-{os.getuid()}-1.db").write_bytes(b"plain")
+            # files that MUST SURVIVE (non-fmail secrets, unrelated, program, template)
+            survivors = {
+                "sudo": secrets / "sudo", "github": secrets / "github",
+                "outside": d / "keepme.txt", "program": data / "fmail.py",
+                "template": data / "accounts.toml.example",
+            }
+            for p in survivors.values():
+                p.write_text("KEEP")
+
+            fmail.emergency_wipe()
+
+            destroyed = [vault.VAULT_PATH, vault.VAULT_HOME, autocrypt.AUTOCRYPT_HOME,
+                         autocrypt.PEERS_DB, data / ".fmail_cache.db.gpg", fmail.SENT_LOG,
+                         fmail.STATE_PATH, fmail.TLS_PINS, fmail.SIGNATURE_DIR,
+                         fmail.CONFIG_PATH, pwf]
+            still = [p for p in destroyed if p.exists()]
+            assert not still, f"NOT wiped (leak): {still}"
+            gone = [k for k, p in survivors.items() if not p.exists()]
+            assert not gone, f"wrongly destroyed (over-wipe): {gone}"
+    finally:
+        fmail.CONFIG_PATH, fmail.STATE_PATH, fmail.SENT_LOG = save["cfg"], save["state"], save["sent"]
+        fmail.TLS_PINS, fmail.SIGNATURE_DIR, fmail.SHM_DIR = save["tls"], save["sig"], save["shm"]
+        vault.VAULT_PATH, vault.VAULT_HOME = save["vp"], save["vh"]
+        autocrypt.AUTOCRYPT_HOME, autocrypt.PEERS_DB = save["ah"], save["pdb"]
+        if save["home"] is not None:
+            os.environ["HOME"] = save["home"]
+
+
+def test_emergency_wipe_no_escape():
+    """Red team CRITICAL: a hostile/typo password_file (a DIRECTORY, '~', a path OUTSIDE
+    ~/secrets, a symlink pointing out) must NEVER make the wipe escape its scope. And the
+    macOS fallback cache (no /dev/shm) MUST be wiped. HOME is redirected to a temp dir so
+    even a validation bug could only touch throwaway paths."""
+    import vault
+    import autocrypt
+    save = {k: getattr(fmail, a) for k, a in (("cfg", "CONFIG_PATH"), ("state", "STATE_PATH"),
+            ("sent", "SENT_LOG"), ("tls", "TLS_PINS"), ("sig", "SIGNATURE_DIR"), ("shm", "SHM_DIR"))}
+    save["vp"], save["vh"] = vault.VAULT_PATH, vault.VAULT_HOME
+    save["ah"], save["pdb"] = autocrypt.AUTOCRYPT_HOME, autocrypt.PEERS_DB
+    save["home"] = os.environ.get("HOME")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            os.environ["HOME"] = str(d)                 # ~ and ~/secrets → temp (SAFE)
+            data = d / "freyja-mail"; data.mkdir()
+            secrets = d / "secrets"; secrets.mkdir()
+            fmail.CONFIG_PATH = data / "accounts.toml"
+            fmail.STATE_PATH = data / ".s"; fmail.SENT_LOG = data / "sent.log"
+            fmail.TLS_PINS = data / ".tls"; fmail.SIGNATURE_DIR = data / "sig"
+            fmail.SHM_DIR = str(d / "noshm")            # absent → macOS-like disk fallback
+            vault.VAULT_PATH = data / "vault.gpg"; vault.VAULT_HOME = data / ".gnupg-vault"
+            autocrypt.AUTOCRYPT_HOME = data / ".ac"; autocrypt.PEERS_DB = data / ".acdb"
+            vault.VAULT_PATH.write_bytes(b"V")
+            legit = secrets / "dm_mail_password"; legit.write_text("creds")   # referenced → wiped
+            # hostile password_file values + things that MUST survive
+            outside_dir = d / "Documents"; outside_dir.mkdir(); (outside_dir / "taxes.pdf").write_text("$$$")
+            outside_file = d / "important.txt"; outside_file.write_text("keep")
+            keep_sudo = secrets / "sudo"; keep_sudo.write_text("SUDO")        # in ~/secrets but NOT referenced
+            sym_target = d / "elsewhere_secret"; sym_target.write_text("x")
+            sym = secrets / "link_pw"
+            try:
+                sym.symlink_to(sym_target)
+            except OSError:
+                sym = None
+            # HARDLINK inside ~/secrets to a file OUTSIDE roots: the shared inode's content
+            # must NOT be overwritten (st_nlink>1 → rejected).
+            hl_victim = d / "hardlink_victim"; hl_victim.write_text("SHARED-INODE-DATA")
+            hl = secrets / "hardlink_pw"
+            try:
+                os.link(hl_victim, hl)
+            except OSError:
+                hl = None
+            cfg = (f'[accounts.a]\nemail="a@b.c"\nimap_host="x"\npassword_file="{legit}"\n'
+                   f'[accounts.b]\nemail="b@b.c"\nimap_host="x"\npassword_file="{outside_dir}"\n'   # a DIR
+                   f'[accounts.c]\nemail="c@b.c"\nimap_host="x"\npassword_file="~"\n'                # HOME
+                   f'[accounts.e]\nemail="e@b.c"\nimap_host="x"\npassword_file="{outside_file}"\n')  # outside roots
+            if sym:
+                cfg += f'[accounts.f]\nemail="f@b.c"\nimap_host="x"\npassword_file="{sym}"\n'         # symlink out
+            if hl:
+                cfg += f'[accounts.g]\nemail="g@b.c"\nimap_host="x"\npassword_file="{hl}"\n'          # hardlink-out
+            fmail.CONFIG_PATH.write_text(cfg)
+            cwf = data / f"fmail-cache-{os.getuid()}-9999.db"; cwf.write_bytes(b"PLAINTEXT-MAILS")
+
+            fmail.emergency_wipe()
+
+            # destroyed: referenced creds, vault, AND the macOS fallback cache
+            assert not legit.exists(), "referenced creds not wiped"
+            assert not vault.VAULT_PATH.exists()
+            assert not cwf.exists(), "macOS fallback cache survived the wipe (CRITICAL)"
+            # NOTHING out of scope touched
+            assert outside_dir.exists() and (outside_dir / "taxes.pdf").exists(), "DIR password_file → over-wipe!"
+            assert outside_file.exists(), "outside-root password_file wiped"
+            assert keep_sudo.exists(), "~/secrets/sudo (unreferenced) wiped"
+            assert (d / "important.txt").exists()
+            if sym:
+                assert sym_target.exists(), "symlink-out target wiped"
+            if hl:
+                assert hl_victim.read_text() == "SHARED-INODE-DATA", "hardlink-shared inode content destroyed"
+    finally:
+        for k, a in (("cfg", "CONFIG_PATH"), ("state", "STATE_PATH"), ("sent", "SENT_LOG"),
+                     ("tls", "TLS_PINS"), ("sig", "SIGNATURE_DIR"), ("shm", "SHM_DIR")):
+            setattr(fmail, a, save[k])
+        vault.VAULT_PATH, vault.VAULT_HOME = save["vp"], save["vh"]
+        autocrypt.AUTOCRYPT_HOME, autocrypt.PEERS_DB = save["ah"], save["pdb"]
+        if save["home"] is not None:
+            os.environ["HOME"] = save["home"]
+
+
+def test_close_cache_no_freeze():
+    """Quit/relock bug: _close_cache must NOT block forever when the sync thread holds
+    _sync_lock (long initial sync). It waits bounded, then proceeds best-effort and STILL
+    wipes the cleartext. Here the lock is held and NEVER released."""
+    import glob
+    import threading
+    import time as _t
+    import vault
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        fmail.CONFIG_PATH = d / "accounts.toml"
+        fmail.CONFIG_PATH.write_text("[accounts.dm]\nemail='a@b.c'\nimap_host='x'\npassword_file=''\n")
+        vault.VAULT_PATH = d / "vault.gpg"; vault.VAULT_HOME = d / "gh"
+        vault.create("MasterPass-Costaud-42", accounts={"dm": "pw"},
+                     path=vault.VAULT_PATH, home=vault.VAULT_HOME)
+        vault.unlock("MasterPass-Costaud-42", path=vault.VAULT_PATH, home=vault.VAULT_HOME)
+        a = fmail_tui.App.__new__(fmail_tui.App)
+        a.sec = fmail.Security(master_password=True, encrypt_cache=True)
+        a.status = ""; a._sync_lock = threading.Lock(); a._cache_closed = False; a._cache_work = None
+        a._open_cache()
+        a.store.set_folder_state("dm", "INBOX", 7, 7, 1.0)
+        work = Path(a._cache_work)
+        a._sync_lock.acquire()                       # simulate a stuck/long in-flight sync (never released)
+        t0 = _t.time()
+        a._close_cache()                             # must return (bounded), not freeze
+        elapsed = _t.time() - t0
+        assert elapsed < 9, f"_close_cache blocked too long ({elapsed:.0f}s) — freeze not fixed"
+        assert a._cache_closed is True
+        enc = d / ".fmail_cache.db.gpg"
+        clear = [f for f in glob.glob(str(d / ".fmail_cache.db*")) if not f.endswith(".gpg")]
+        assert enc.exists() and clear == [] and glob.glob(str(work) + "*") == [], \
+            "cleartext not wiped on best-effort close"
+        a._sync_lock.release()
+
+
+def test_self_update():
+    """In-app update: SHA-256 verified, all-or-nothing, config NEVER clobbered, hostile
+    manifest names ignored. Served from a local file:// 'release' (no network)."""
+    import hashlib
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        remote = d / "release"; remote.mkdir()
+        app = d / "app"; app.mkdir()
+        data = d / "data"; data.mkdir()
+        (app / "fmail.py").write_text("# OLD program\n")
+        keep_cfg = data / "accounts.toml"; keep_cfg.write_text("[accounts.me]\n")  # must survive
+        # build the 'release'
+        newpy = "# NEW program v9\n"
+        (remote / "fmail.py").write_text(newpy)
+        (remote / "VERSION").write_text("9.9.9-beta\n")
+        (remote / "accounts.toml.example").write_text("# new template\n")
+        def sha(p):
+            return hashlib.sha256(p.read_bytes()).hexdigest()
+        sums = "".join(f"{sha(remote/n)}  {n}\n" for n in ("fmail.py", "VERSION", "accounts.toml.example"))
+        sums += "deadbeef" * 8 + "  ../../etc/evil\n"        # hostile name → must be ignored
+        sums += hashlib.sha256(b"x").hexdigest() + "  evil.sh\n"  # non-fmail kind → ignored
+        (remote / "SHA256SUMS").write_text(sums)
+        base = "file://" + str(remote)
+
+        # check_update: remote differs from our version → not up to date
+        ver, uptodate = fmail.check_update(base)
+        assert ver == "9.9.9-beta" and uptodate is False
+        # self_update installs the new files
+        newv = fmail.self_update(app, data, base)
+        assert newv == "9.9.9-beta"
+        assert (app / "fmail.py").read_text() == newpy           # program replaced
+        assert (app / "VERSION").read_text().strip() == "9.9.9-beta"
+        assert (data / "accounts.toml.example").read_text() == "# new template\n"
+        assert keep_cfg.read_text() == "[accounts.me]\n"         # CONFIG NOT clobbered
+        assert not (app / "evil.sh").exists() and not (d / "etc").exists()  # hostile names ignored
+
+        # all-or-nothing: a corrupted manifest entry aborts WITHOUT writing anything
+        (app / "fmail.py").write_text("# OLD again\n")
+        bad = sums.replace(sha(remote / "fmail.py"), "0" * 64)   # wrong hash for fmail.py
+        (remote / "SHA256SUMS").write_text(bad)
+        try:
+            fmail.self_update(app, data, base)
+            raise AssertionError("checksum mismatch not detected")
+        except fmail.FmailError:
+            pass
+        assert (app / "fmail.py").read_text() == "# OLD again\n"  # untouched on failure
+
+
+def test_update_dev_guard_source():
+    """The update flow refuses to self-update from the data/dev dir (reuses the uninstall
+    clash guard) and is wired in the Config menu."""
+    src = Path("fmail_tui.py").read_text(encoding="utf-8")
+    assert '"__update__"' in src and "_update_flow" in src
+    body = src.split("def _update_flow", 1)[1][:500]      # the method definition
+    assert "_uninstall_paths()" in body and "clash" in body
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

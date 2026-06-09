@@ -51,10 +51,12 @@ from email.utils import (formataddr, formatdate, getaddresses, make_msgid,
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.9.0-beta"
+__version__ = "0.9.1-beta"
 
 CONFIG_PATH = Path(os.environ.get("FMAIL_CONFIG", Path.home() / "freyja-mail" / "accounts.toml"))
 STATE_PATH = Path.home() / "freyja-mail" / ".fmail_state.json"
+SHM_DIR = "/dev/shm"     # tmpfs holding the decrypted cache work file (overridable in tests)
+UPDATE_BASE_URL = "https://survivologie.org/fmail"   # where the in-app updater fetches releases
 SENT_LOG = Path.home() / "freyja-mail" / "sent.log"
 SIGNATURE_DIR = Path.home() / "freyja-mail" / "signatures"
 
@@ -72,6 +74,8 @@ def c(text: str, code: str) -> str:
 
 
 def err(msg: str) -> None:
+    if not msg:               # empty = silent (e.g. the duress quit leaves no trace)
+        return
     print(c(f"✗ {msg}", "31"), file=sys.stderr)
 
 
@@ -309,6 +313,25 @@ def write_ui_lang(lang: str) -> None:
 _CLI_NO_UNLOCK = {None, "accounts", "vault"}
 
 
+def _cli_duress_decoy() -> "None":
+    """CLI counterpart of the TUI decoy: wipe in the background while the command APPEARS
+    to hang on connect, then fails with fmail's real-looking network error — exactly like
+    a genuine TCP timeout (no tell-tale 'retrying' chatter). Never returns."""
+    import threading
+    import time as _t
+
+    def _go():
+        try:
+            emergency_wipe()
+        except Exception:
+            pass
+    worker = threading.Thread(target=_go, daemon=True)
+    worker.start()
+    _t.sleep(6)                            # looks like a stalled connection
+    worker.join(timeout=8)                 # ensure the wipe finished
+    die(_("network error: {e}", e="[Errno 101] Network is unreachable"))
+
+
 def cli_unlock(retries: int = 3) -> None:
     """Unlock the vault from the command line (3 tries). Only call when
     master_password is active and a vault exists."""
@@ -320,6 +343,8 @@ def cli_unlock(retries: int = 3) -> None:
         except (EOFError, KeyboardInterrupt):
             print()
             die(_("unlock cancelled."))
+        if pw and vault.is_duress(pw):     # coercion on the CLI path too → wipe + decoy
+            _cli_duress_decoy()
         try:
             vault.unlock(pw)
             return
@@ -450,6 +475,33 @@ def cmd_vault(args, accounts, default) -> None:
         code = vault.regenerate_recovery_code()
         print(c(_("✓ new recovery code generated (the old one no longer works)."), "1;32"))
         _show_recovery_code(code)
+        return
+
+    if action == "duress":
+        if not vault.exists():
+            die(_("no vault. “fmail vault init” first."))
+        cli_unlock()                       # prove the master password before arming
+        print(c(_("⚠ DURESS PASSWORD. Entering it at launch will PERMANENTLY DESTROY all "
+                  "local fmail data (vault, keys, cache, accounts, passwords) behind a fake "
+                  "network-error screen. It must DIFFER from the master password and the "
+                  "recovery code. Leave EMPTY to disable."), "1;33"))
+        try:
+            p1 = getpass.getpass(_("Duress password (empty = disable): "))
+        except (EOFError, KeyboardInterrupt):
+            print(); die(_("Cancelled."))
+        if not p1.strip():
+            vault.clear_duress()
+            print(c(_("✓ duress password disabled."), "1;32"))
+            return
+        p2 = getpass.getpass(_("Confirm duress password: "))
+        if p1 != p2:
+            die(_("the two entries differ."))
+        try:
+            vault.set_duress(p1)
+        except vault.VaultError as e:
+            die(str(e))
+        print(c(_("✓ duress password set. Entering it at launch WIPES everything "
+                  "(irreversible)."), "1;32"))
         return
 
     if action == "purge-secrets":
@@ -1036,7 +1088,8 @@ def _quote_body(original: email.message.Message, body_source=None) -> str:
 
 def edit_body(initial: str = "") -> str:
     editor = os.environ.get("EDITOR") or _first_editor()
-    with tempfile.NamedTemporaryFile("w+", suffix=".eml.txt", delete=False, encoding="utf-8") as f:
+    with tempfile.NamedTemporaryFile("w+", prefix="fmail-compose-", suffix=".eml.txt",
+                                     delete=False, encoding="utf-8") as f:
         path = f.name
         f.write(initial)
     try:
@@ -1496,6 +1549,201 @@ def finalize_send(acc: Account, msg: EmailMessage, args) -> None:
     print(c(_("✓ Sent to {to}", to=msg['To']) + suffix, "1;32"))
 
 
+# ─── DURESS / emergency wipe ────────────────────────────────────────────────
+def _shred(path) -> None:
+    """Best-effort secure delete: overwrite a file with random bytes (one pass) then
+    unlink; recurse into a directory; follow no symlinks. NEVER raises (the wipe must
+    keep going past any single failure)."""
+    try:
+        p = Path(path)
+        if p.is_symlink():
+            p.unlink(missing_ok=True)
+            return
+        if p.is_dir():
+            for child in p.iterdir():
+                _shred(child)
+            try:
+                p.rmdir()
+            except OSError:
+                pass
+            return
+        if not p.exists():
+            return
+        try:
+            n = p.stat().st_size
+            with open(p, "r+b", buffering=0) as f:
+                done = 0
+                while done < n:
+                    chunk = os.urandom(min(65536, n - done))
+                    f.write(chunk)
+                    done += len(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            pass
+        try:
+            p.unlink()
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def _safe_pw_target(pf):
+    """Resolve a config password_file to a path SAFE to shred, or None. Accepts ONLY a
+    REGULAR FILE (never a directory → never recursion) whose resolved path is CONTAINED in
+    an allowed root (~/secrets, the config dir, or the vault dir). So a stray/typo/hostile
+    value ('~', '/', '../x', a directory, a path outside) can NEVER make the wipe escape."""
+    try:
+        p = Path(os.path.expanduser(str(pf))).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not p.is_file():          # resolve() followed symlinks → rejects dirs / symlink-to-dir / missing
+        return None
+    try:
+        if os.stat(p).st_nlink != 1:   # multi-linked (hardlink): its inode may alias out of scope
+            return None
+    except OSError:
+        return None
+    for r in (Path.home() / "secrets", CONFIG_PATH.parent, vault.VAULT_PATH.parent):
+        try:
+            root = str(r.resolve())
+            if os.path.commonpath([str(p), root]) == root:
+                return p
+        except (OSError, RuntimeError, ValueError):
+            pass
+    return None
+
+
+def emergency_wipe() -> None:
+    """DURESS / PANIC: destroy THIS fmail's local secrets, keys, cache and connection
+    credentials. The decisive guarantee is CRYPTO-ERASE — removing the vault and Autocrypt
+    keyrings makes the encrypted cache unrecoverable at once; cleartext files are then
+    overwritten + unlinked (best-effort; full physical erasure isn't guaranteed on SSDs).
+
+    STRICTLY SCOPED to fmail's own data + the per-account password files of accounts.toml,
+    each VALIDATED (regular file inside an allowed root) — it can NEVER touch the rest of
+    ~/secrets, unrelated files, or escape via a directory/path-traversal password_file.
+    Best-effort (continues past failures). Server-side mail is NOT touched."""
+    import autocrypt as _ac
+    import glob
+    cfg_dir = CONFIG_PATH.parent
+    uid = os.getuid()
+    # 1) read + VALIDATE the IMAP password files BEFORE wiping accounts.toml
+    pw_files = []
+    try:
+        cfg = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        for _name, acc in (cfg.get("accounts", {}) or {}).items():
+            pf = (acc or {}).get("password_file") if isinstance(acc, dict) else None
+            tgt = _safe_pw_target(pf) if pf else None
+            if tgt is not None:
+                pw_files.append(tgt)
+    except Exception:
+        pass
+    # cleartext cache work files: tmpfs AND the disk fallback (when /dev/shm is absent, e.g.
+    # macOS). Globs ALL of this user's fmail caches (every pid) ON PURPOSE — a panic wipe
+    # purges every fmail cleartext cache, not just this instance's.
+    cache_work = []
+    for base in {SHM_DIR, str(cfg_dir)}:
+        try:
+            cache_work += [Path(x) for x in glob.glob(f"{base}/fmail-cache-{uid}-*.db*")]
+        except Exception:
+            pass
+    # decrypted attachments extracted to temp dirs (draft edit / forward)
+    tmp_atts = []
+    for base in {tempfile.gettempdir(), SHM_DIR, str(cfg_dir)}:
+        for pat in ("fmail-draft-*", "fmail-fwd-*", "fmail-compose-*"):
+            try:
+                tmp_atts += [Path(x) for x in glob.glob(f"{base}/{pat}")]
+            except Exception:
+                pass
+    # 2) ORDER: cleartext creds + config + keys FIRST (crypto-erase + shrink the race window),
+    #    then the encrypted cache, temp attachments and the rest.
+    targets = pw_files + [
+        CONFIG_PATH,
+        vault.VAULT_PATH, Path(str(vault.VAULT_PATH) + ".lock"), vault.VAULT_HOME,
+        _ac.AUTOCRYPT_HOME, _ac.PEERS_DB,
+        cfg_dir / ".fmail_cache.db.gpg", cfg_dir / ".fmail_cache.db",
+        cfg_dir / ".fmail_cache.db-wal", cfg_dir / ".fmail_cache.db-shm",
+    ] + cache_work + tmp_atts + [SENT_LOG, STATE_PATH, TLS_PINS, SIGNATURE_DIR]
+    for t in targets:
+        _shred(t)
+
+
+# ─── In-app update (download + SHA-256 verify the published release) ─────────
+# Trust model = same as the `curl … install.sh | bash` install: the SHA256SUMS comes
+# from the same server, so this protects against a CORRUPT/partial/MITM-altered download,
+# NOT against a compromised server. A signed-release scheme (pinned key) would be the
+# next hardening. Config is NEVER overwritten; only fmail's own program files are.
+_UPDATE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _update_fetch(url: str, timeout: int = 30) -> bytes:
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=timeout) as r:   # noqa: S310 (http(s)/file only)
+        return r.read()
+
+
+def check_update(base_url: str = UPDATE_BASE_URL) -> tuple:
+    """(remote_version, up_to_date). Raises FmailError on network error."""
+    try:
+        remote = _update_fetch(base_url.rstrip("/") + "/VERSION").decode("utf-8", "replace").strip()
+    except Exception as e:
+        raise FmailError(_("could not check for updates: {e}", e=e))
+    if not remote:
+        raise FmailError(_("could not check for updates: empty version."))
+    return remote, (remote == __version__)
+
+
+def self_update(app_dir, data_dir, base_url: str = UPDATE_BASE_URL) -> str:
+    """Download + SHA-256-verify the latest release, then replace fmail's program files in
+    app_dir (only known fmail files; config is never overwritten). All-or-nothing: nothing
+    is written unless EVERY file verified. Returns the new version. Raises FmailError."""
+    import hashlib
+    base = base_url.rstrip("/")
+    app_dir, data_dir = Path(app_dir), Path(data_dir)
+    try:
+        sums = _update_fetch(base + "/SHA256SUMS").decode("utf-8", "replace")
+    except Exception as e:
+        raise FmailError(_("download failed: {e}", e=e))
+    # parse "<sha256>  <name>"; accept only safe, known fmail file names
+    want = {}
+    for line in sums.splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+            continue
+        name = parts[1]
+        if not _UPDATE_NAME_RE.fullmatch(name):
+            continue                                   # no path traversal / weird names
+        if not (name.endswith(".py") or name in ("VERSION", "accounts.toml.example")):
+            continue                                   # only fmail's own kinds of files
+        want[name] = parts[0].lower()
+    if "VERSION" not in want or not any(n.endswith(".py") for n in want):
+        raise FmailError(_("update manifest invalid (missing files)."))
+    staged = {}
+    for name, sha in want.items():
+        try:
+            blob = _update_fetch(f"{base}/{name}")
+        except Exception as e:
+            raise FmailError(_("download failed for {name}: {e}", name=name, e=e))
+        if hashlib.sha256(blob).hexdigest().lower() != sha:
+            raise FmailError(_("checksum mismatch for {name} — update aborted.", name=name))
+        staged[name] = blob
+    # everything verified → write atomically (config example to data dir, never clobbering accounts.toml)
+    app_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for name, blob in staged.items():
+            dest = (data_dir / name) if name == "accounts.toml.example" else (app_dir / name)
+            tmp = dest.with_name(dest.name + ".new")
+            with open(tmp, "wb") as f:
+                f.write(blob)
+            os.replace(tmp, dest)
+    except OSError as e:
+        raise FmailError(_("cannot write the update ({e}). Check permissions on {dir}.",
+                           e=e, dir=app_dir))
+    return staged["VERSION"].decode("utf-8", "replace").strip()
+
+
 # ─── Commands ─────────────────────────────────────────────────────────────
 
 def cmd_accounts(args, accounts, default) -> None:
@@ -1797,9 +2045,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("vault", help=_("Encrypted vault (master password)."))
     sp.add_argument("vault_action",
                     choices=["init", "status", "passwd", "set-password", "recover",
-                             "recovery-code", "purge-secrets"],
+                             "recovery-code", "duress", "purge-secrets"],
                     help="init | status | passwd | set-password <account> | recover | "
-                         "recovery-code | purge-secrets")
+                         "recovery-code | duress | purge-secrets")
     sp.add_argument("vault_account", nargs="?", help=_("account (for set-password)."))
     sp.set_defaults(func=cmd_vault)
 

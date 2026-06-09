@@ -152,8 +152,61 @@ def main():
 
     _test_kdf_and_migration()
     _test_truncated_envelope()
+    _test_duress()
     print("✅ test_vault : tous les tests passent (fichiers/GNUPGHOME temporaires)")
     return 0
+
+
+def _test_duress():
+    """Mot de passe de contrainte (durci red team) : set/is/clear + anti-collision
+    maître/récup ET maître≠contrainte, slot INDISTINGUABLE (toujours présent), NFC.
+    Fichiers TEMPORAIRES."""
+    import json
+    import unicodedata
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "vault.gpg"
+        home = Path(d) / "gnupg"
+        MP = "Mot-De-Passe-Maitre-Costaud-42"
+        _c, RECOV = v.create(MP, accounts={"dm": "pw"}, path=path, home=home)
+        # OPSEC : un slot "duress" existe DÈS la création (placeholder aléatoire) → la
+        # présence d'un duress ne fuite pas, et rien ne matche tant qu'il n'est pas défini
+        assert "duress" in json.loads(path.read_bytes())
+        assert not v.is_duress("nimporte", path, home)
+        DURESS = "Contrainte-Panique-2026"
+        v.set_duress(DURESS, path, home)
+        assert v.is_duress(DURESS, path, home)            # match exact
+        assert not v.is_duress("autre", path, home)
+        assert not v.is_duress(MP, path, home) and not v.is_duress(RECOV, path, home)
+        # la contrainte doit DIFFÉRER du maître et du code de récupération
+        for clash in (MP, RECOV):
+            try:
+                v.set_duress(clash, path, home); raise AssertionError("contrainte == maître/récup acceptée")
+            except v.VaultError:
+                pass
+        # anti-auto-déclenchement : le maître ne peut JAMAIS devenir == la contrainte
+        for fn in (lambda: v.change_passphrase(MP, DURESS, path, home),
+                   lambda: v.reset_master_with_recovery(RECOV, DURESS, path, home)):
+            try:
+                fn(); raise AssertionError("maître = contrainte accepté (auto-wipe au bon mdp !)")
+            except v.VaultError:
+                pass
+        # NFC : un duress accentué matche quelle que soit la forme saisie (NFC vs NFD)
+        v.set_duress(unicodedata.normalize("NFC", "Pâté-Café-2026"), path, home)
+        assert v.is_duress(unicodedata.normalize("NFD", "Pâté-Café-2026"), path, home)
+        # le coffre s'ouvre toujours normalement (rien cassé)
+        assert v.read_vault(MP, path, home)["accounts"]["dm"] == "pw"
+        v.unlock_with_recovery(RECOV, path, home); v.lock()
+        # AUTO-01 : même si le vérifieur duress matche le maître (collision NFC simulée
+        # en injectant verify = scrypt(NFC(maître))), is_duress(maître) doit rendre FALSE
+        # — le vrai identifiant gagne TOUJOURS, jamais d'auto-wipe au bon mot de passe.
+        env = json.loads(path.read_bytes())
+        env["duress"] = v._duress_make_slot(MP)        # duress == maître (collision)
+        v._write_cipher(json.dumps(env).encode("utf-8"), path)
+        assert not v.is_duress(MP, path, home), "le MAÎTRE déclenche le wipe (AUTO-01 non corrigé)"
+        assert not v.is_duress(RECOV, path, home)
+        # désactivation → placeholder ; le slot reste présent (indistinguable) mais ne matche plus
+        v.clear_duress(path, home)
+        assert "duress" in json.loads(path.read_bytes()) and not v.is_duress(MP, path, home)
 
 
 def _test_kdf_and_migration():

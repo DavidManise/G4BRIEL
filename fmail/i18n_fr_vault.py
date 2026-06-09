@@ -4,6 +4,12 @@
 """French catalog for vault.py (English msgid -> original French text)."""
 
 CATALOG = {
+    "the duress password must DIFFER from the master password "
+    "and the recovery code.":
+        "le mot de passe de contrainte doit ÊTRE DIFFÉRENT du mot de passe maître "
+        "et du code de récupération.",
+    "the new master password must DIFFER from the duress password.":
+        "le nouveau mot de passe maître doit ÊTRE DIFFÉRENT du mot de passe de contrainte.",
     "gpg: timed out": "gpg: delai depasse (timeout)",
     "gpg: not found": "gpg: introuvable",
     "encryption failed: {err}": "chiffrement échoué : {err}",

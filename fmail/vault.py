@@ -22,10 +22,12 @@ from __future__ import annotations
 import base64
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import subprocess
 import time
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -293,6 +295,7 @@ def create(passphrase: str, accounts: dict | None = None, contacts: list | None 
     env = {"fmt": 3, "kdf": kdf,
            "slots": {"password": _wrap(dek, _kdf_passphrase(passphrase, kdf), ensure_home_),
                      "recovery": _wrap(dek, _norm_recovery(code), ensure_home_)},
+           "duress": _duress_make_slot(None),   # random placeholder → presence undetectable
            "body": _body_b64(content, dek, ensure_home_)}
     _write_cipher(json.dumps(env).encode("utf-8"), path)
     return content, code
@@ -305,6 +308,8 @@ def change_passphrase(old: str, new: str, path: Path = VAULT_PATH,
     _check_passphrase(new)
     with _vault_lock(path):
         env = _read_envelope(path)
+        if _duress_match(env.get("duress"), new):              # never let the master == duress
+            raise VaultError(_("the new master password must DIFFER from the duress password."))
         dek = _unwrap_password(env, old, home)                 # BadPassphrase if old is wrong
         env["fmt"] = 3
         env["kdf"] = _make_kdf()                               # fresh salt on each change
@@ -319,6 +324,8 @@ def reset_master_with_recovery(recovery_code: str, new_master: str,
     _check_passphrase(new_master)
     with _vault_lock(path):
         env = _read_envelope(path)
+        if _duress_match(env.get("duress"), new_master):       # never let the master == duress
+            raise VaultError(_("the new master password must DIFFER from the duress password."))
         try:
             dek = _unwrap(env["slots"]["recovery"], _norm_recovery(recovery_code), home)
         except BadPassphrase:
@@ -373,6 +380,15 @@ def unlock(passphrase: str, path: Path = VAULT_PATH, home: Path = VAULT_HOME) ->
             _upgrade_password_kdf(passphrase, dek, Path(path), Path(home))
         except Exception:
             pass                         # best-effort migration: never blocking
+    if not isinstance(env.get("duress"), dict):   # legacy vault -> add placeholder duress slot
+        try:
+            with _vault_lock(path):
+                e2 = _read_envelope(path)
+                if not isinstance(e2.get("duress"), dict):
+                    e2["duress"] = _duress_make_slot(None)
+                    _write_cipher(json.dumps(e2).encode("utf-8"), path)
+        except Exception:
+            pass
     return data
 
 
@@ -387,6 +403,100 @@ def unlock_with_recovery(recovery_code: str, path: Path = VAULT_PATH,
     data = _decrypt_body(env, dek, home)
     _state.update(data=data, dek=dek, path=Path(path), home=Path(home), last_active=time.time())
     return data
+
+
+# ─── DURESS / PANIC password ─────────────────────────────────────────────────
+# An OPTIONAL extra password. Entering it at unlock does NOT open the vault: it
+# signals the caller to DESTROY all local data (see fmail.emergency_wipe) behind a
+# decoy. Only a scrypt VERIFIER (salt+hash) is stored — never the password — so it can
+# be checked at the lock screen without opening the vault.
+#
+# OPSEC: a duress slot is ALWAYS present (a random, never-matching placeholder when no
+# duress is configured), so the envelope looks byte-shaped identical whether or not a
+# duress password is set — an adversary inspecting vault.gpg cannot tell.
+def _duress_norm(pw) -> str:
+    return unicodedata.normalize("NFC", pw or "")    # NFC so accented inputs match deterministically
+
+
+def _duress_make_slot(pw):
+    """Build a duress slot. pw=None → a RANDOM (never-matching) placeholder."""
+    salt = os.urandom(16)
+    verify = (os.urandom(32) if pw is None else
+              hashlib.scrypt(_duress_norm(pw).encode("utf-8"), salt=salt, n=KDF_N,
+                             r=KDF_R, p=KDF_P, dklen=32, maxmem=KDF_MAXMEM))
+    return {"algo": "scrypt", "n": KDF_N, "r": KDF_R, "p": KDF_P,
+            "salt": base64.b64encode(salt).decode("ascii"),
+            "verify": base64.b64encode(verify).decode("ascii")}
+
+
+def _duress_match(slot, entered) -> bool:
+    """Constant-time check that `entered` matches the slot's verifier. False on a random
+    placeholder. Never raises."""
+    if not (isinstance(slot, dict) and slot.get("algo") == "scrypt"):
+        return False
+    try:
+        salt = base64.b64decode(slot["salt"])
+        verify = base64.b64decode(slot["verify"])
+        got = hashlib.scrypt(_duress_norm(entered).encode("utf-8"), salt=salt, n=int(slot["n"]),
+                             r=int(slot["r"]), p=int(slot["p"]), dklen=32, maxmem=KDF_MAXMEM)
+    except Exception:
+        return False
+    return hmac.compare_digest(got, verify)
+
+
+def set_duress(duress_pw: str, path: Path = VAULT_PATH, home: Path = VAULT_HOME) -> None:
+    """Define the duress password. Refuses one that opens the vault (i.e. equals the
+    master password or the recovery code) — it MUST be distinct."""
+    _check_passphrase(duress_pw)
+    with _vault_lock(path):
+        env = _read_envelope(path)
+        collide = False
+        try:
+            _unwrap_password(env, duress_pw, home); collide = True       # == master ?
+        except BadPassphrase:
+            pass
+        if not collide:
+            try:
+                _unwrap(env["slots"]["recovery"], _norm_recovery(duress_pw), home); collide = True  # == recovery ?
+            except BadPassphrase:
+                pass
+        if collide:
+            raise VaultError(_("the duress password must DIFFER from the master password "
+                               "and the recovery code."))
+        env["duress"] = _duress_make_slot(duress_pw)
+        _write_cipher(json.dumps(env).encode("utf-8"), path)
+
+
+def clear_duress(path: Path = VAULT_PATH, home: Path = VAULT_HOME) -> None:
+    """Disable duress — replaced by a random placeholder (stays indistinguishable)."""
+    with _vault_lock(path):
+        env = _read_envelope(path)
+        env["duress"] = _duress_make_slot(None)
+        _write_cipher(json.dumps(env).encode("utf-8"), path)
+
+
+def is_duress(entered: str, path: Path = VAULT_PATH, home: Path = VAULT_HOME) -> bool:
+    """True iff `entered` matches a configured duress password. Never raises; safe at
+    the lock screen."""
+    try:
+        env = _read_envelope(path)
+    except VaultError:
+        return False
+    if not _duress_match(env.get("duress"), entered):
+        return False
+    # SAFETY (AUTO-01): a duress that collides with the real master password or recovery
+    # code — e.g. via Unicode normalization (NFC/NFD) — must NEVER trigger a wipe. The
+    # legitimate credential ALWAYS wins: if `entered` actually opens the vault, it is not
+    # a duress trigger.
+    try:
+        _unwrap_password(env, entered, home); return False       # it's the master
+    except BadPassphrase:
+        pass
+    try:
+        _unwrap(env["slots"]["recovery"], _norm_recovery(entered), home); return False  # it's the recovery code
+    except BadPassphrase:
+        pass
+    return True
 
 
 def is_unlocked() -> bool:

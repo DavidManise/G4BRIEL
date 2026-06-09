@@ -6,6 +6,32 @@ Maps the English source strings (the message-ids used in fmail_tui.py) back to
 their original French wording. Placeholder names match the code exactly.
 """
 CATALOG = {
+    # ── In-app update (Config menu) ──────────────────────────────────────
+    "Update fmail…": "Mettre à jour fmail…",
+    "Update fmail": "Mise à jour de fmail",
+    " Update fmail": " Mise à jour de fmail",
+    "fmail runs from its data/dev directory ({app}) — updating here would\n"
+    "overwrite local files. Update it with git, or re-run the installer.":
+        "fmail tourne depuis son dossier de données/dev ({app}) — une mise à jour ici\n"
+        "écraserait des fichiers locaux. Mets-le à jour via git, ou relance l'installeur.",
+    "Checking for updates…": "Vérification des mises à jour…",
+    "fmail is up to date (v{v}).": "fmail est à jour (v{v}).",
+    "A new version is available:": "Une nouvelle version est disponible :",
+    "  installed: v{v}": "  installée : v{v}",
+    "  latest:    v{v}": "  dernière :  v{v}",
+    "Download and install it now?  [Y/n]": "La télécharger et l'installer maintenant ?  [O/n]",
+    "Downloading update…": "Téléchargement de la mise à jour…",
+    "✓ Updated to v{v}.": "✓ Mis à jour en v{v}.",
+    "Restart fmail to run the new version.": "Redémarre fmail pour lancer la nouvelle version.",
+    "Quit fmail now to restart?  [Y/n]": "Quitter fmail maintenant pour redémarrer ?  [O/n]",
+    "✓ updated to v{v} — restart fmail to apply.":
+        "✓ mis à jour en v{v} — redémarre fmail pour appliquer.",
+    # ── Duress decoy (fake connection failure while wiping) ──────────────
+    "Connecting to {host}": "Connexion à {host}",
+    "authenticating…": "authentification…",
+    "connection failed — retrying in 3 s…": "échec de connexion — nouvelle tentative dans 3 s…",
+    "Error: could not reach the mail server (connection timed out).":
+        "Erreur : impossible de joindre le serveur de messagerie (délai de connexion dépassé).",
     # ── Launch splash ────────────────────────────────────────────────────
     "secure terminal mail": "messagerie sécurisée au terminal",
     # ── First-launch wizard: add an account ──────────────────────────────
@@ -311,12 +337,20 @@ CATALOG = {
 
     # ── Search & pickers ───────────────────────────────────────────────────
     "Search: ": "Recherche : ",
+    "Searching “{q}” on the server…": "Recherche de « {q} » sur le serveur…",
+    "server search unavailable — filtering locally (subject/sender).":
+        "recherche serveur indisponible — filtrage local (objet/expéditeur).",
     "server search unavailable ({e}) — local filter":
         "recherche serveur indisponible ({e}) — filtre local",
     "Short name (e.g. personal)": "Nom court (ex: perso)",
     "Email address": "Adresse e-mail",
     "IMAP server": "Serveur IMAP",
     "SMTP server": "Serveur SMTP",
+    "IMAP server (host, or host:port)": "Serveur IMAP (hôte, ou hôte:port)",
+    "SMTP server (host, or host:port — Enter = same as IMAP)":
+        "Serveur SMTP (hôte, ou hôte:port — Entrée = même que l'IMAP)",
+    "{proto} port — a number, or Enter for the usual {default}":
+        "Port {proto} — un nombre, ou Entrée pour la valeur habituelle {default}",
     "Display name (optional)": "Nom affiché (optionnel)",
     "Password (or app password): ": "Mot de passe (ou mot de passe d'application) : ",
     "✓ account \"{name}\" added and selected.":

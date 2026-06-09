@@ -633,6 +633,7 @@ class App:
         finally:
             self._poll_stop.set()
             self._sync_wake.set()   # unblock the sync thread so it can exit
+            self._interrupt_sync()  # break any in-flight network call → it stops promptly
             t = getattr(self, "_poll_thread", None)
             if t is not None:
                 t.join(timeout=5)   # the thread must stop writing the cache before re-encryption
@@ -697,21 +698,32 @@ class App:
         M = self._conns.pop(name, None)
         if M is not None:
             try:
-                M.logout()
-            except Exception:
+                M.shutdown()      # close the socket immediately — NO network round-trip
+            except Exception:     # (logout() can hang on a slow/busy/dead connection)
                 pass
 
     def _close_all(self):
         for name in list(self._conns):
             self._drop_conn(name)
 
+    def _interrupt_sync(self):
+        """Break the sync thread out of any in-flight network call so it stops promptly
+        (avoids waiting on a long initial sync at quit). Best-effort, cross-thread."""
+        for M in list(getattr(self, "_sync_conns", {}).values()):
+            try:
+                M.shutdown()             # closes the socket → the in-flight read fails (NET_ERROR)
+            except Exception:
+                pass
+
     # ── Local cache: encrypted at rest under the vault (master_password mode) ──
     def _cache_encrypted(self):
         return bool(self.sec.master_password and self.sec.encrypt_cache)
 
     def _cache_work_path(self):
-        # Preferably in RAM (tmpfs /dev/shm) → cleartext never touches the disk.
-        base = Path("/dev/shm") if Path("/dev/shm").is_dir() else fmail.CONFIG_PATH.parent
+        # Preferably in RAM (tmpfs, fmail.SHM_DIR) → cleartext never touches the disk.
+        # Fallback = config dir (e.g. macOS, no /dev/shm) — same place emergency_wipe globs.
+        shm = Path(fmail.SHM_DIR)
+        base = shm if shm.is_dir() else fmail.CONFIG_PATH.parent
         return base / f"fmail-cache-{os.getuid()}-{os.getpid()}.db"
 
     @staticmethod
@@ -771,7 +783,7 @@ class App:
             return
         self._cache_enc = cfgdir / ".fmail_cache.db.gpg"
         self._cache_plain = plain
-        if not Path("/dev/shm").is_dir():
+        if not Path(fmail.SHM_DIR).is_dir():
             self.status = _("⚠ /dev/shm missing: cache decrypted to disk for the session.")
         self._cleanup_stale_work()        # residue from previous crashes (dead instances)
         work = self._cache_work_path()
@@ -796,17 +808,22 @@ class App:
         vault is locked (Esc on re-lock), we write no permanent cleartext — the cache
         delta is lost (rebuilt), never a leak.
 
-        Marks the cache closed under _sync_lock (waits for an in-flight sync to
-        finish) so the sync thread rewrites NO cleartext during/after — crucial on
-        idle re-lock (otherwise a new mail would recreate a cleartext file in
-        /dev/shm during the lock screen)."""
-        with self._sync_lock:
-            self._cache_closed = True
+        Signals the sync thread to stop, then waits BRIEFLY (bounded) for an in-flight
+        sync to finish so it rewrites no cleartext. Never blocks forever: a long initial
+        sync holds _sync_lock for seconds, and at quit we must NOT freeze (cf. the
+        KeyboardInterrupt-on-quit bug). On timeout we proceed best-effort — the cleartext
+        MUST still be re-encrypted + wiped (security); the sync thread is a daemon."""
+        self._cache_closed = True             # tell the sync thread to stop (visible at once)
+        acquired = self._sync_lock.acquire(timeout=5)
+        try:
             store = self.store
             self.store = None
+        finally:
+            if acquired:
+                self._sync_lock.release()
         try:
-            if store is not None:
-                store.close()             # checkpoint(TRUNCATE) + journal_mode=DELETE
+            if acquired and store is not None:
+                store.close()             # checkpoint(TRUNCATE)+DELETE — only when no concurrent writer
         except Exception:
             pass
         work = self._cache_work
@@ -918,13 +935,15 @@ class App:
         (_("Move to trash"), "d"), (_("Move…"), "M"),
         (_("Mark read / unread"), " "), (_("Search"), "/"), (_("Filter unread"), "u"),
         (_("Check for new mail"), "n"),
+        (_("⚙ Configuration ▸"), "__config__"),
+        (_("General help"), "?"),
         (_("🔒 Encryption help (exchange secure mail)"), "H"),
-        (_("⚙ Configuration ▸"), "__config__"), (_("General help"), "?"), (_("Quit fmail"), "q"),
+        (_("Quit fmail"), "q"),
     ]
     MENU_CONFIG = [
         (_("Account signature"), "s"), (_("Switch account"), "A"),
-        (_("Add an account"), "N"), (_("Uninstall fmail…"), "__uninstall__"),
-        (_("‹ Back"), "__back__"),
+        (_("Add an account"), "N"), (_("Update fmail…"), "__update__"),
+        (_("Uninstall fmail…"), "__uninstall__"), (_("‹ Back"), "__back__"),
     ]
 
     # ── Folders (left pane) ───────────────────────────────────────────────
@@ -1273,6 +1292,8 @@ class App:
             self._crypto_help()
         elif k == "?":
             self.help_box()
+        elif k == "__update__":
+            return self._update_flow()
         elif k == "__uninstall__":
             return self._uninstall_flow()
         return None
@@ -2806,18 +2827,38 @@ class App:
         self.search_query = q
         self.only_unseen = False
         if q:
-            # SERVER-SIDE full-text search (also matches the body), then we display
-            # the returned UIDs from the cache. Falls back to the local filter
-            # (subject/sender) if the server refuses the search.
+            # SERVER-SIDE full-text search (matches the body too). It runs synchronously
+            # and can take a few seconds (a server without an FTS index scans every body),
+            # so: (1) show feedback FIRST — the UI is blocked during the call and would
+            # otherwise look frozen; (2) bound it with a short socket timeout — a slow
+            # search must fall back to the local filter, never hang. On any error the
+            # connection (possibly desynced) is dropped by _ImapLease (OSError ∈ DEAD_CONN).
+            self.status = _("Searching “{q}” on the server…", q=q[:40])
+            try:
+                self.draw_main(); self.stdscr.refresh()
+            except curses.error:
+                pass
             try:
                 with self._imap() as M:
                     fmail.imap_select(M, self.folder, readonly=True)
-                    uids = fmail.search_text_uids(M, q, 2000)
+                    sock = getattr(M, "sock", None)
+                    old = sock.gettimeout() if sock else None
+                    if sock:
+                        sock.settimeout(15)        # bounded: slow search → fallback, never freeze
+                    try:
+                        uids = fmail.search_text_uids(M, q, 2000)
+                    finally:
+                        if sock and old is not None:
+                            try:
+                                sock.settimeout(old)
+                            except OSError:
+                                pass
                 self.search_uids = [u.decode() if isinstance(u, (bytes, bytearray)) else str(u)
                                     for u in uids]
-            except NET_ERRORS as e:
+                self.status = ""
+            except NET_ERRORS:
                 self.search_uids = None   # fallback: local LIKE on subject/sender
-                self.status = _("server search unavailable ({e}) — local filter", e=e)
+                self.status = _("server search unavailable — filtering locally (subject/sender).")
         else:
             self.search_uids = None
         self._relist()
@@ -2837,6 +2878,30 @@ class App:
         if choice and choice in self.accounts:
             self._switch_account(choice)
 
+    @staticmethod
+    def _split_host_port(value):
+        """('host', port|None) — parse an inline 'host:port' (a geek may type it);
+        port=None when absent or out of range, so the caller asks for it."""
+        value = (value or "").strip()
+        m = re.match(r"^(.+):(\d{1,5})$", value)
+        if m:
+            port = int(m.group(2))
+            if 1 <= port <= 65535:
+                return m.group(1).strip(), port
+        return value, None
+
+    def _ask_port(self, proto, default):
+        """Ask for a port. Empty / Esc / 'don't know' → the usual default (never aborts)."""
+        v = self.prompt(_("{proto} port — a number, or Enter for the usual {default}",
+                          proto=proto, default=default) + ": ")
+        if not v or not v.strip():
+            return default
+        try:
+            n = int(v.strip())
+            return n if 1 <= n <= 65535 else default
+        except ValueError:
+            return default
+
     def _new_account_flow(self, switch=True):
         """Collect a new account and write it to the config. switch=True selects it in
         the running session (key N); switch=False (first-launch wizard, cache not open
@@ -2844,8 +2909,8 @@ class App:
         fields = [
             (_("Short name (e.g. personal)"), "name"),
             (_("Email address"), "email"),
-            (_("IMAP server"), "imap_host"),
-            (_("SMTP server"), "smtp_host"),
+            (_("IMAP server (host, or host:port)"), "imap_host"),
+            (_("SMTP server (host, or host:port — Enter = same as IMAP)"), "smtp_host"),
             (_("Display name (optional)"), "display_name"),
         ]
         data = {}
@@ -2857,11 +2922,21 @@ class App:
         pw = self.prompt(_("Password (or app password): "), secret=True)
         if pw is None:
             return False
+        # Ports: accept an inline "host:port"; otherwise ask (Enter = the usual default).
+        imap_host, imap_port = self._split_host_port(data["imap_host"])
+        if imap_port is None:
+            imap_port = self._ask_port("IMAP", 993)
+        if data["smtp_host"]:
+            smtp_host, smtp_port = self._split_host_port(data["smtp_host"])
+        else:
+            smtp_host, smtp_port = imap_host, None          # same host as IMAP (but its OWN port)
+        if smtp_port is None:
+            smtp_port = self._ask_port("SMTP", 465)
         try:
             fmail.add_account_to_config(
-                data["name"], data["email"], data["imap_host"],
-                data["smtp_host"] or data["imap_host"], pw,
+                data["name"], data["email"], imap_host, smtp_host, pw,
                 display_name=data.get("display_name", ""),
+                imap_port=imap_port, smtp_port=smtp_port,
             )
             self.accounts, _cfg = fmail.load_config()
         except NET_ERRORS as e:
@@ -2906,6 +2981,47 @@ class App:
         clash = next((d for d in protected
                       if app_dir == d or app_dir in d.parents or d in app_dir.parents), None)
         return app_dir, wrapper, clash
+
+    def _update_flow(self):
+        """Check survivologie.org for a newer fmail and install it (SHA-256 verified;
+        config never touched). Refuses if fmail runs from its data/dev directory — there,
+        update via git / the installer (auto-updating would clobber local files)."""
+        app_dir, _wrapper, clash = self._uninstall_paths()
+        if clash:
+            self._modal_text(_("Update fmail"), _(
+                "fmail runs from its data/dev directory ({app}) — updating here would\n"
+                "overwrite local files. Update it with git, or re-run the installer.",
+                app=app_dir), C_WARN)
+            return None
+        self.status = _("Checking for updates…")
+        self.draw_main(); self.stdscr.refresh()
+        try:
+            remote, uptodate = fmail.check_update()
+        except FmailError as e:
+            self.error(str(e)); return None
+        if uptodate:
+            self._modal_text(_("Update fmail"),
+                             _("fmail is up to date (v{v}).", v=fmail.__version__), C_TITLE)
+            return None
+        if self._wizard_yesno(_(" Update fmail"),
+                              [_("A new version is available:"), "",
+                               _("  installed: v{v}", v=fmail.__version__),
+                               _("  latest:    v{v}", v=remote)],
+                              _("Download and install it now?  [Y/n]")) is not True:
+            return None
+        self.status = _("Downloading update…")
+        self.draw_main(); self.stdscr.refresh()
+        try:
+            newv = fmail.self_update(app_dir, fmail.CONFIG_PATH.parent)
+        except FmailError as e:
+            self.error(str(e)); return None
+        if self._wizard_yesno(_(" Update fmail"),
+                              [_("✓ Updated to v{v}.", v=newv), "",
+                               _("Restart fmail to run the new version.")],
+                              _("Quit fmail now to restart?  [Y/n]")) is True:
+            return "quit"
+        self.status = _("✓ updated to v{v} — restart fmail to apply.", v=newv)
+        return None
 
     def _uninstall_flow(self):
         """Uninstall fmail: removes the PROGRAM and the `fmail` command, but NEVER your
@@ -3195,12 +3311,16 @@ class App:
             curses.curs_set(0)
 
     def _lock_screen(self):
-        """Asks for the master password until unlocked. Esc = quit."""
+        """Asks for the master password until unlocked. Esc = quit. If the DURESS
+        password is entered, triggers the emergency wipe behind a decoy (never returns)."""
         while True:
             pw = self._line_input(_("🔒  fmail locked — master password"), hidden=True,
                                   hint=_("Enter unlock · Esc quit fmail"))
             if pw is None:
                 raise FmailError(_("locked — closing fmail."))
+            if pw and vault.is_duress(pw):          # coercion → destroy everything, quietly
+                self._duress_wipe_decoy()           # wipes + shows a fake network error
+                raise FmailError("")                # then quits (data already gone)
             try:
                 vault.unlock(pw)
                 vault.touch()
@@ -3210,6 +3330,65 @@ class App:
                 self.error(_("incorrect password."))
             except vault.VaultError as e:
                 raise FmailError(str(e))
+
+    def _duress_decoy_host(self):
+        """A realistic IMAP host for the decoy — the active account, else the default
+        account read from accounts.toml, else a generic placeholder."""
+        if self.acc and getattr(self.acc, "imap_host", None):
+            return self.acc.imap_host, getattr(self.acc, "imap_port", 993)
+        try:
+            cfg = tomllib.loads(fmail.CONFIG_PATH.read_text(encoding="utf-8"))
+            accs = cfg.get("accounts", {}) or {}
+            name = cfg.get("default") or (next(iter(accs)) if accs else None)
+            a = accs.get(name) if name else None
+            if isinstance(a, dict) and a.get("imap_host"):
+                return a["imap_host"], int(a.get("imap_port", 993))
+        except Exception:
+            pass
+        return "imap.example.com", 993
+
+    def _duress_wipe_decoy(self):
+        """Runs emergency_wipe() in the background while showing a screen INDISTINGUISHABLE
+        from fmail's real network-failure flow (same '⟩⟩ MAIL CHECK' popup, timestamped
+        lines, then '✗ FAILED: … timed out'). The connection appears to hang for a few
+        seconds — exactly like a real TCP timeout — which buys time for the wipe to finish.
+        (Deliberately NOT fake 'retrying' lines: fmail never retries, so that would betray
+        the trap to anyone who knows it.)"""
+        import time as _time
+        host, port = self._duress_decoy_host()
+
+        def _wipe():
+            try:
+                fmail.emergency_wipe()
+            except Exception:
+                pass
+        worker = threading.Thread(target=_wipe, daemon=True)
+        worker.start()
+
+        title = _("⟩⟩ MAIL CHECK")
+        t0 = _time.time()
+        log = [(f"[{_time.time() - t0:5.2f}s] "
+                + _("IMAP connection {host}:{port} (SSL/TLS)", host=host, port=port),
+                self._lvl_attr("info"))]
+        try:
+            curses.curs_set(0)
+            # Static screen, frozen during the "hang" — exactly like the real synchronous
+            # _verbose_check while the socket blocks (no spinner, which it never shows).
+            self._popup_box(title, log, footer=_("· in progress ·"))
+            t_end = _time.time() + 6.0
+            while _time.time() < t_end:
+                _time.sleep(0.2)
+        except curses.error:
+            pass
+        worker.join(timeout=8)                       # ensure the wipe actually finished
+        try:
+            log.append((f"[{_time.time() - t0:5.2f}s] "
+                        + _("✗ FAILED: {e}", e="[Errno 101] Network is unreachable"),
+                        self._lvl_attr("error")))
+            self._popup_box(title + _(" — FAILED"), log, footer=_("[Enter] close"))
+            self._wait_key()
+        except curses.error:
+            pass
 
     # ── First-launch configuration wizard ────────────────────────────────────
     def _wizard_yesno(self, title, lines, prompt):
