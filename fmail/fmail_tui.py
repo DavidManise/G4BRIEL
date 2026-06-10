@@ -593,10 +593,24 @@ class App:
         self.stdscr.refresh()
         self._wait_key_or_timeout(1300)         # any key skips; otherwise a short beat
 
+    def _mouse_off(self):
+        # fmail never uses the mouse (it calls no mousemask). But a terminal — or a
+        # previous full-screen app that exited without resetting — can leave mouse
+        # tracking ON. curses then doesn't consume those reports, so their raw bytes
+        # leak into the key stream: the trailing 'M' of an SGR/X10 report (ESC[<…M,
+        # ESC[M) lands squarely on the "Move to folder" command. Turn every
+        # mouse-reporting mode OFF at the source so no report is ever emitted:
+        #   1000 normal · 1002 button-motion · 1003 any-motion · 1005/1006/1015 ext.
+        try:
+            os.write(1, b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l")
+        except OSError:
+            pass
+
     def main(self, stdscr):
         self.stdscr = stdscr
         curses.curs_set(0)
         stdscr.keypad(True)
+        self._mouse_off()             # defuse stray trackpad/mouse signals (see _mouse_off)
         try:
             curses.set_escdelay(25)   # responsive Esc (otherwise ~1 s default latency)
         except (curses.error, AttributeError):
@@ -860,6 +874,15 @@ class App:
         # BaseException that bubbles up through the modal loops to main_loop.
         if arm and k is None and vault.idle_expired(self.sec.lock_timeout):
             raise _IdleLock()
+        # Defence in depth: if a mouse event still arrives (tracking re-enabled by a
+        # multiplexer), curses parsed it as KEY_MOUSE — drain and treat it as no key,
+        # so its bytes can never reach a command handler.
+        if k == curses.KEY_MOUSE:
+            try:
+                curses.getmouse()
+            except curses.error:
+                pass
+            return None
         return k
 
     # ── Low-level drawing ─────────────────────────────────────────────────

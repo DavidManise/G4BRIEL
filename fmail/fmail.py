@@ -51,7 +51,7 @@ from email.utils import (formataddr, formatdate, getaddresses, make_msgid,
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.9.1-beta"
+__version__ = "0.9.2-beta"
 
 CONFIG_PATH = Path(os.environ.get("FMAIL_CONFIG", Path.home() / "freyja-mail" / "accounts.toml"))
 STATE_PATH = Path.home() / "freyja-mail" / ".fmail_state.json"

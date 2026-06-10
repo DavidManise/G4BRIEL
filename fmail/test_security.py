@@ -483,6 +483,31 @@ def test_update_dev_guard_source():
     assert "_uninstall_paths()" in body and "clash" in body
 
 
+def test_mouse_reporting_disabled():
+    """fmail must never let stray trackpad/mouse signals turn into commands: at startup
+    it disables EVERY mouse-tracking mode (…l) and enables NONE (…h), and _getkey drains
+    a parsed KEY_MOUSE event to None so its bytes can't reach a command handler."""
+    app = fmail_tui.App.__new__(fmail_tui.App)
+    captured = {}
+    orig = os.write
+    os.write = lambda fd, b: (captured.__setitem__("fd", fd), captured.__setitem__("b", b), len(b))[-1]
+    try:
+        app._mouse_off()
+    finally:
+        os.write = orig
+    b = captured["b"]
+    assert captured["fd"] == 1                                  # the controlling terminal
+    for mode in (b"1000l", b"1002l", b"1003l", b"1005l", b"1006l", b"1015l"):
+        assert mode in b, f"mouse mode {mode!r} not disabled"
+    assert b"h" not in b, "must NEVER enable mouse reporting (no …h)"
+    # the input chokepoint swallows a parsed mouse event instead of dispatching it,
+    # and the disable is actually wired at startup
+    src = Path("fmail_tui.py").read_text(encoding="utf-8")
+    body = src.split("def _getkey", 1)[1].split("\n    def ", 1)[0]   # the whole _getkey method
+    assert "curses.KEY_MOUSE" in body and "curses.getmouse()" in body
+    assert "self._mouse_off()" in src.split("def main", 1)[1][:400]
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
