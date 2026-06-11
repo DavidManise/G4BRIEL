@@ -89,7 +89,7 @@ CATALOG = {
     "(To erase your data too — irreversible — delete those yourself.)":
         "(Pour effacer aussi tes données — irréversible — supprime-les toi-même.)",
     " Uninstall fmail": " Désinstaller fmail",
-    "Remove the fmail program?  [y/N] ": "Retirer le programme fmail ?  [o/N] ",
+    " Remove the fmail program?  [y/N] ": " Retirer le programme fmail ?  [o/N] ",
     "fmail has been removed. Your data is kept in {data}.":
         "fmail a été retiré. Tes données sont conservées dans {data}.",
     "Uninstall finished with errors: {err}": "Désinstallation terminée avec des erreurs : {err}",
@@ -141,6 +141,8 @@ CATALOG = {
     "Archive": "Archiver",
     "Move to trash": "Mettre à la corbeille",
     "Move…": "Déplacer…",
+    "Undo last move": "Annuler le dernier déplacement",
+    "Address book": "Carnet d'adresses",
     "Mark read / unread": "Marquer lu / non-lu",
     "Search": "Rechercher",
     "Filter unread": "Filtrer non-lus",
@@ -329,6 +331,15 @@ CATALOG = {
         "dossier de destination introuvable (configure-le dans accounts.toml).",
     "{verb} → {dest}?   {info}": "{verb} → {dest} ?   {info}",
     "✓ moved to {dest}": "✓ déplacé vers {dest}",
+    "✓ moved to {dest}   (z: undo)": "✓ déplacé vers {dest}   (z : annuler)",
+    "select a mail first (Tab or →).": "sélectionne d'abord un mail (Tab ou →).",
+    "nothing to undo.": "rien à annuler.",
+    "cannot undo: that message could not be identified.":
+        "annulation impossible : ce message n'a pas pu être identifié.",
+    "cannot undo: the message is no longer in {dest}.":
+        "annulation impossible : le message n'est plus dans {dest}.",
+    "✓ move undone (back in {src}).": "✓ déplacement annulé (de retour dans {src}).",
+    " {question}  [y/N] ": " {question}  [O/n] ",
     "copy to {dest} failed.": "copie vers {dest} échouée.",
     "copied to {dest}, but not purged at source (UID {uid} stays \"deleted\").":
         "copié vers {dest}, mais non purgé en source (UID {uid} reste « supprimé »).",
@@ -590,20 +601,25 @@ CATALOG = {
     "  c             compose a new message\n"
     "  r / R / f     reply / reply to all / forward\n"
     "  a             archive        d / Del: trash\n"
-    "  M             move to a folder\n"
+    "  M             move to a folder      z: undo the last move\n"
     "  Space         mark read / unread\n"
+    "  C             address book (contacts)\n"
     "  / u           search · filter unread\n"
     "  n             check for new mail (silent auto-poll every 5 min)\n"
-    "  g             go to the accounts/folders pane\n\n"
+    "  g             go to the accounts/folders pane\n"
+    "  In a mail:    s save attachments · v verify a changed key\n\n"
     "Configuration (menu m → ⚙, or direct shortcuts)\n"
     "  s             edit the account signature\n"
     "  A             switch account\n"
     "  N             add a new account\n\n"
     "Editing (compose)\n"
     "  Tab           next field   (Shift+Tab: previous)\n"
+    "  ^E            encryption: auto → forced → off\n"
+    "  ^F            choose the sending account (From)\n"
     "  ^T            format: auto-detect → plain text → Markdown→HTML (default: auto)\n"
     "  ^O            attach a file (browser: cd, ls, ⇥ completes)\n"
     "  ^X            remove the last attachment\n"
+    "  ^A            encryption help\n"
     "  ^G            send\n"
     "  Esc           quit: Discard / Save the draft / Back\n\n"
     "  q             quit fmail":
@@ -622,20 +638,25 @@ CATALOG = {
         "  c             composer un nouveau message\n"
         "  r / R / f     répondre / répondre à tous / transférer\n"
         "  a             archiver        d / Suppr : corbeille\n"
-        "  M             déplacer vers un dossier\n"
+        "  M             déplacer vers un dossier   z : annuler le dernier déplacement\n"
         "  Espace        marquer lu / non-lu\n"
+        "  C             carnet d'adresses (contacts)\n"
         "  / u           rechercher · filtrer non-lus\n"
         "  n             vérifier les nouveaux mails (poll auto silencieux toutes les 5 min)\n"
-        "  g             aller au volet comptes/dossiers\n\n"
+        "  g             aller au volet comptes/dossiers\n"
+        "  Dans un mail :s enregistrer les PJ · v vérifier une clé changée\n\n"
         "Configuration (menu m → ⚙, ou raccourcis directs)\n"
         "  s             éditer la signature du compte\n"
         "  A             changer de compte\n"
         "  N             ajouter un nouveau compte\n\n"
         "Édition (composer)\n"
         "  Tab           champ suivant   (Maj+Tab : précédent)\n"
+        "  ^E            chiffrement : auto → forcé → désactivé\n"
+        "  ^F            choisir le compte expéditeur (De)\n"
         "  ^T            format : auto-détection → texte brut → Markdown→HTML (défaut : auto)\n"
         "  ^O            joindre un fichier (explorateur : cd, ls, ⇥ complète)\n"
         "  ^X            retirer la dernière pièce jointe\n"
+        "  ^A            aide au chiffrement\n"
         "  ^G            envoyer\n"
         "  Échap         quitter : Abandonner / Sauvegarder le brouillon / Revenir\n\n"
         "  q             quitter fmail",

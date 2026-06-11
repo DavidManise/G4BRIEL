@@ -11,6 +11,10 @@ CATALOG = {
         "impossible de vérifier les mises à jour : version vide.",
     "download failed: {e}": "échec du téléchargement : {e}",
     "download failed for {name}: {e}": "échec du téléchargement de {name} : {e}",
+    "release signature (SHA256SUMS.asc) missing — update refused.":
+        "signature de la version (SHA256SUMS.asc) absente — mise à jour refusée.",
+    "INVALID release signature — update refused. Do NOT trust this download.":
+        "signature de la version INVALIDE — mise à jour refusée. Ne PAS faire confiance à ce téléchargement.",
     "update manifest invalid (missing files).": "manifeste de mise à jour invalide (fichiers manquants).",
     "checksum mismatch for {name} — update aborted.":
         "empreinte incohérente pour {name} — mise à jour annulée.",
@@ -340,4 +344,5 @@ CATALOG = {
     "IMAP error (connection interrupted?): {e}":
         "erreur IMAP (connexion interrompue ?) : {e}",
     "network error: {e}": "erreur réseau : {e}",
+    "interrupted.": "interrompu.",
 }

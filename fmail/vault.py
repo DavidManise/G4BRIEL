@@ -166,9 +166,10 @@ def _check_passphrase(pw: str) -> None:
 # We therefore pre-derive the master password via scrypt (memory-hard) BEFORE gpg,
 # for this slot only. Versioned by `fmt`: a fmt 2 vault (without `kdf`) stays
 # readable with the raw password and is migrated to fmt 3 transparently.
-KDF_N, KDF_R, KDF_P = 1 << 15, 8, 1          # scrypt ~ 32 MiB of RAM per attempt
-KDF_MAXMEM = 96 * 1024 * 1024                 # 128*n*r (~32 MiB) is a floor that
-#                                               OpenSSL refuses as-is: ~3x margin.
+KDF_N, KDF_R, KDF_P = 1 << 17, 8, 1          # scrypt ~ 128 MiB of RAM per attempt (OWASP-recommended)
+KDF_MAXMEM = 256 * 1024 * 1024                # 128*n*r (~128 MiB) is the floor OpenSSL refuses
+#                                               as-is; ~2x margin. Generous enough to also read
+#                                               legacy 2^15/2^16 vaults under this same cap.
 
 
 def _make_kdf() -> dict:
@@ -355,14 +356,26 @@ def regenerate_recovery_code(path: Path = VAULT_PATH, home: Path = VAULT_HOME) -
 _state: dict = {"data": None, "dek": None, "path": None, "home": None, "last_active": 0.0}
 
 
+def _kdf_is_weak(kdf) -> bool:
+    """True if the password slot has no scrypt pre-derivation (legacy fmt 2) or a weaker
+    cost than the current KDF_N (an older vault sealed before a parameter bump)."""
+    if not kdf:
+        return True
+    try:
+        return int(kdf.get("n", 0)) < KDF_N
+    except (TypeError, ValueError):
+        return True
+
+
 def _upgrade_password_kdf(master: str, dek: str, path: Path, home: Path) -> None:
-    """Transparent fmt 2 -> fmt 3 migration: re-seals the password slot under a scrypt
-    pre-derivation (the DEK, the body and the recovery lock are unchanged). Idempotent
-    and best-effort (never blocks unlocking)."""
+    """Transparent KDF hardening: re-seals the password slot under a fresh scrypt
+    pre-derivation at the CURRENT cost (fmt 2 -> fmt 3, or a weaker fmt 3 -> stronger).
+    The DEK, the body and the recovery lock are unchanged. Idempotent and best-effort
+    (never blocks unlocking)."""
     with _vault_lock(path):
         env = _read_envelope(path)
-        if env.get("kdf"):
-            return                       # already migrated (by this session or another)
+        if not _kdf_is_weak(env.get("kdf")):
+            return                       # already at full strength (this session or another)
         env["fmt"] = 3
         env["kdf"] = _make_kdf()
         env["slots"]["password"] = _wrap(dek, _kdf_passphrase(master, env["kdf"]), home)
@@ -375,7 +388,7 @@ def unlock(passphrase: str, path: Path = VAULT_PATH, home: Path = VAULT_HOME) ->
     dek = _unwrap_password(env, passphrase, home)
     data = _decrypt_body(env, dek, home)
     _state.update(data=data, dek=dek, path=Path(path), home=Path(home), last_active=time.time())
-    if not env.get("kdf"):               # legacy fmt 2 vault -> harden the KDF in place
+    if _kdf_is_weak(env.get("kdf")):     # legacy fmt 2 or weaker-than-current KDF -> harden in place
         try:
             _upgrade_password_kdf(passphrase, dek, Path(path), Path(home))
         except Exception:

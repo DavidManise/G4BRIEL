@@ -51,7 +51,7 @@ from email.utils import (formataddr, formatdate, getaddresses, make_msgid,
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.9.2-beta"
+__version__ = "0.9.3-beta"
 
 CONFIG_PATH = Path(os.environ.get("FMAIL_CONFIG", Path.home() / "freyja-mail" / "accounts.toml"))
 STATE_PATH = Path.home() / "freyja-mail" / ".fmail_state.json"
@@ -328,7 +328,12 @@ def _cli_duress_decoy() -> "None":
     worker = threading.Thread(target=_go, daemon=True)
     worker.start()
     _t.sleep(6)                            # looks like a stalled connection
-    worker.join(timeout=8)                 # ensure the wipe finished
+    # Ensure the wipe finished before we exit (a daemon thread dies with the process).
+    # emergency_wipe() does the decisive CRYPTO-ERASE first (creds, vault + keyrings — see
+    # its target ordering), so the irreversible part lands in the first ~1 s; the rest
+    # (≈2-3 MB encrypted cache + temp files) shreds in 1-2 s more. join() returns as soon
+    # as that completes, so the 20 s cap is a safety ceiling, not a typical wait.
+    worker.join(timeout=20)
     die(_("network error: {e}", e="[Errno 101] Network is unreachable"))
 
 
@@ -1088,8 +1093,12 @@ def _quote_body(original: email.message.Message, body_source=None) -> str:
 
 def edit_body(initial: str = "") -> str:
     editor = os.environ.get("EDITOR") or _first_editor()
+    # Compose in RAM-backed tmpfs (/dev/shm) when available so the outgoing cleartext never
+    # touches a persistent disk; fall back to the default temp dir otherwise. The finally
+    # below unlinks it, and emergency_wipe() also targets fmail-compose-* in both locations.
+    tmpdir = SHM_DIR if (os.path.isdir(SHM_DIR) and os.access(SHM_DIR, os.W_OK)) else None
     with tempfile.NamedTemporaryFile("w+", prefix="fmail-compose-", suffix=".eml.txt",
-                                     delete=False, encoding="utf-8") as f:
+                                     delete=False, encoding="utf-8", dir=tmpdir) as f:
         path = f.name
         f.write(initial)
     try:
@@ -1670,11 +1679,64 @@ def emergency_wipe() -> None:
         _shred(t)
 
 
-# ─── In-app update (download + SHA-256 verify the published release) ─────────
-# Trust model = same as the `curl … install.sh | bash` install: the SHA256SUMS comes
-# from the same server, so this protects against a CORRUPT/partial/MITM-altered download,
-# NOT against a compromised server. A signed-release scheme (pinned key) would be the
-# next hardening. Config is NEVER overwritten; only fmail's own program files are.
+# ─── In-app update (signed release: verify signature + SHA-256, then replace) ─────────
+# Trust model: the release manifest (SHA256SUMS) is SIGNED by the pinned release key below,
+# and every program file is pinned by its SHA-256 inside that signed manifest. So an update
+# is trusted only if (1) SHA256SUMS carries a valid signature from RELEASE_FPR AND (2) each
+# file matches its listed hash. This protects against a COMPROMISED SERVER / MITM, not just a
+# corrupted download. Fail-closed: no signature / wrong key → update refused. Config is NEVER
+# overwritten; only fmail's own program files are.
+#
+# RELEASE_PUBKEY / RELEASE_FPR are the public half of the offline signing key (ed25519). The
+# private key lives only on the release host (see make-dist.sh) — never shipped, never here.
+RELEASE_FPR = "FB67AAB3077A7D1FE2912D241789A63411D480BE"
+RELEASE_PUBKEY = """\
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEaisKhRYJKwYBBAHaRw8BAQdAfho32qVRzUJAs0K0CNHl1EbNhBRy6EuxuydW
+RNJ6Lfu0MmZtYWlsIHJlbGVhc2Ugc2lnbmluZyBrZXkgPGZtYWlsQHN1cnZpdm9s
+b2dpZS5vcmc+iJMEExYKADsWIQT7Z6qzB3p9H+KRLSQXiaY0EdSAvgUCaisKhQIb
+AwULCQgHAgIiAgYVCgkICwIEFgIDAQIeBwIXgAAKCRAXiaY0EdSAvoe/AQDHn4jf
+Hz9dr/XRqnud5RLQIMS39GCVxNgWsQCoLQyORwEAuXXAz4RN9Bp0NbaIa52wtHMz
+AWKmmY35xdZUlUoz7QI=
+=YyWj
+-----END PGP PUBLIC KEY BLOCK-----
+"""
+
+
+def _gpg_verify_detached(pubkey_armored: str, signed: bytes, sig: bytes) -> bool:
+    """True iff `sig` is a valid detached signature of `signed` made by RELEASE_FPR.
+    Verified in an EPHEMERAL keyring holding ONLY the embedded release key, so a signature
+    from any other key (or no signature) can never validate. Never raises."""
+    import shutil
+    try:
+        home = tempfile.mkdtemp(prefix="fmail-relverify-")
+    except OSError:
+        return False
+    try:
+        os.chmod(home, 0o700)
+        env = {"PATH": os.environ.get("PATH", ""), "LC_ALL": "C", "GNUPGHOME": home}
+        base = ["gpg", "--homedir", home, "--batch", "--no-tty", "--quiet",
+                "--no-options", "--disable-dirmngr"]
+        imp = subprocess.run(base + ["--import"], input=pubkey_armored.encode("ascii"),
+                             capture_output=True, env=env, timeout=30)
+        if imp.returncode != 0:
+            return False
+        sig_path, data_path = os.path.join(home, "m.asc"), os.path.join(home, "m")
+        with open(sig_path, "wb") as f:
+            f.write(sig)
+        with open(data_path, "wb") as f:
+            f.write(signed)
+        res = subprocess.run(base + ["--status-fd=1", "--verify", sig_path, data_path],
+                             capture_output=True, env=env, timeout=30)
+        out = res.stdout.decode("utf-8", "replace")
+        return res.returncode == 0 and ("VALIDSIG " + RELEASE_FPR) in out
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 _UPDATE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -1703,9 +1765,19 @@ def self_update(app_dir, data_dir, base_url: str = UPDATE_BASE_URL) -> str:
     base = base_url.rstrip("/")
     app_dir, data_dir = Path(app_dir), Path(data_dir)
     try:
-        sums = _update_fetch(base + "/SHA256SUMS").decode("utf-8", "replace")
+        sums_bytes = _update_fetch(base + "/SHA256SUMS")
     except Exception as e:
         raise FmailError(_("download failed: {e}", e=e))
+    # ROOT OF TRUST: SHA256SUMS must carry a valid detached signature from the pinned release
+    # key. Verified BEFORE anything in it is trusted, and fail-closed (a missing or invalid
+    # signature aborts the update — this is what protects against a compromised mirror).
+    try:
+        sig_bytes = _update_fetch(base + "/SHA256SUMS.asc")
+    except Exception:
+        raise FmailError(_("release signature (SHA256SUMS.asc) missing — update refused."))
+    if not _gpg_verify_detached(RELEASE_PUBKEY, sums_bytes, sig_bytes):
+        raise FmailError(_("INVALID release signature — update refused. Do NOT trust this download."))
+    sums = sums_bytes.decode("utf-8", "replace")
     # parse "<sha256>  <name>"; accept only safe, known fmail file names
     want = {}
     for line in sums.splitlines():
@@ -2138,6 +2210,10 @@ def main() -> int:
         # Vault errors (weak/illegal password, vault changed…) → clean message, no traceback.
         err(str(e))
         return 1
+    except KeyboardInterrupt:
+        # Ctrl-C during a network/CLI op → clean message + 130, never a raw traceback.
+        err(_("interrupted."))
+        return 130
     return 0
 
 

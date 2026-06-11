@@ -531,6 +531,7 @@ class App:
         self.bar_idx = 0
         self._bar_from = "mails"
         self._special_cache = {}
+        self.last_move = None  # {"msgid","src","dest","info"} of the last move, for undo (z)
         # ── Silent poll of new mail (INBOX) ──────────────────────────────
         self.new_count = 0          # new INBOX mails since the last glance
         self.inbox_total = 0
@@ -955,9 +956,9 @@ class App:
     MENU_MAIN = [
         (_("Open mail"), "\n"), (_("Reply"), "r"), (_("Reply to all"), "R"),
         (_("Forward"), "f"), (_("Compose"), "c"), (_("Archive"), "a"),
-        (_("Move to trash"), "d"), (_("Move…"), "M"),
+        (_("Move to trash"), "d"), (_("Move…"), "M"), (_("Undo last move"), "z"),
         (_("Mark read / unread"), " "), (_("Search"), "/"), (_("Filter unread"), "u"),
-        (_("Check for new mail"), "n"),
+        (_("Check for new mail"), "n"), (_("Address book"), "C"),
         (_("⚙ Configuration ▸"), "__config__"),
         (_("General help"), "?"),
         (_("🔒 Encryption help (exchange secure mail)"), "H"),
@@ -1284,15 +1285,20 @@ class App:
                 self._reply_or_forward(cur.uid, kind=k,
                                        encrypted=(getattr(cur, "encrypted", False) is not False))
         elif k == "a":
-            self._action_move_current(self._special("archive"), _("Archive"))
+            if self._require_mail_focus():
+                self._action_move_current(self._special("archive"), _("Archive"))
         elif k in ("d", curses.KEY_DC):
-            self._action_move_current(self._special("trash"), _("Move to trash"))
+            if self._require_mail_focus():
+                self._action_move_current(self._special("trash"), _("Move to trash"))
         elif k == "m":
             sel = self._open_menu()
             if sel is not None:
                 return self._trigger(sel)
         elif k == "M":
-            self._move_to_folder_current()
+            if self._require_mail_focus():
+                self._move_to_folder_current()
+        elif k == "z":
+            self._undo_last_move()
         elif k == " ":
             self._toggle_seen_current()
         elif k == "/":
@@ -1413,8 +1419,10 @@ class App:
         for i, (idx, s) in enumerate(self.list.visible()):
             dot = "●" if not s.seen else " "
             lk = "🔒" if s.encrypted else "  "   # lock if encrypted (PGP/MIME)
-            # date + time (date_fmt = "YYYY-MM-DD HH:MM"); fixed width for alignment
-            line = f"{dot}{lk} {s.date_fmt[:16]:<16} {s.from_display[:16]:<16} {s.subject or _('(no subject)')}"
+            # date + time (date_fmt = "YYYY-MM-DD HH:MM"); fixed width for alignment.
+            # The sender column widens on roomy panes (≥96 cols), staying 16 on narrow ones.
+            fw = 16 if mw < 96 else min(28, max(16, mw // 4))
+            line = f"{dot}{lk} {s.date_fmt[:16]:<16} {s.from_display[:fw]:<{fw}} {s.subject or _('(no subject)')}"
             is_sel = (idx == self.list.cursor)
             if is_sel and self.focus == "mails":
                 attr = curses.A_REVERSE | curses.A_BOLD
@@ -1711,6 +1719,10 @@ class App:
                     return True
             elif k in ("d", curses.KEY_DC):
                 if self._action_move(summary.uid, self._special("trash"), _("Move to trash")):
+                    return True
+            elif k == "M":
+                dest = self._pick_folder(_("Move to which folder?"))
+                if dest and self._action_move(summary.uid, dest, _("Move")):
                     return True
 
     def _wrap_message(self, headers, body, width, header_attr=None):
@@ -2765,12 +2777,15 @@ class App:
         info = self._peek(uid)
         if not self.confirm(_("{verb} → {dest}?   {info}", verb=verb, dest=dest, info=info)):
             return False
+        src = self.folder
+        msgid = self._uid_msgid(uid)        # capture BEFORE the move (the UID changes on move)
         try:
-            self._do_move(uid, self.folder, dest)
+            self._do_move(uid, src, dest)
         except NET_ERRORS as e:
             self.error(str(e))
             return False
-        self.status = _("✓ moved to {dest}", dest=dest)
+        self.last_move = {"msgid": msgid, "src": src, "dest": dest, "info": info}
+        self.status = _("✓ moved to {dest}   (z: undo)", dest=dest)
         return True
 
     def _do_move(self, uid, src, dest):
@@ -2804,6 +2819,60 @@ class App:
         dest = self._pick_folder(_("Move to which folder?"))
         if dest and self._action_move(cur.uid, dest, _("Move")):
             self._refresh_all()
+
+    def _require_mail_focus(self):
+        """Guard for the mail-targeting actions (archive/trash/move): refuse them while the
+        focus is on the folders pane, where the user means to act on a FOLDER, not on the
+        mail still selected on the right. Avoids an accidental move of the wrong message."""
+        if self.focus == "folders":
+            self.status = _("select a mail first (Tab or →).")
+            return False
+        return True
+
+    def _uid_msgid(self, uid):
+        """The Message-ID of a message in the current folder (so undo can re-find it after a
+        move reassigns its UID). Returns '' if unavailable — undo then degrades gracefully."""
+        try:
+            with self._imap() as M:
+                fmail.imap_select(M, self.folder, readonly=True)
+                typ, md = M.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+                if typ == "OK" and md and isinstance(md[0], tuple):
+                    m = email.message_from_bytes(md[0][1])
+                    return (m.get("Message-ID") or "").strip()
+        except NET_ERRORS:
+            pass
+        return ""
+
+    def _undo_last_move(self):
+        """Reverse the last archive/trash/move: locate the message (by Message-ID) in the
+        folder it landed in and move it back to its origin. Fail-safe: a clear status, never
+        a wrong-message move, if it can't be identified or has since moved/been deleted."""
+        lm = self.last_move
+        if not lm:
+            self.status = _("nothing to undo.")
+            return
+        msgid, src, dest = lm.get("msgid"), lm.get("src"), lm.get("dest")
+        if not msgid:
+            self.status = _("cannot undo: that message could not be identified.")
+            return
+        try:
+            with self._imap() as M:
+                fmail.imap_select(M, dest, readonly=False)
+                typ, data = M.uid("search", None, "HEADER", "Message-ID", msgid)
+                uids = data[0].split() if (typ == "OK" and data and data[0]) else []
+                if not uids:
+                    self.last_move = None
+                    self.status = _("cannot undo: the message is no longer in {dest}.", dest=dest)
+                    return
+                new_uid = uids[-1]
+                new_uid = new_uid.decode() if isinstance(new_uid, (bytes, bytearray)) else str(new_uid)
+            self._do_move(new_uid, dest, src)   # move it back dest → src
+        except NET_ERRORS as e:
+            self.error(str(e))
+            return
+        self.last_move = None
+        self.status = _("✓ move undone (back in {src}).", src=src)
+        self._refresh_all()
 
     def _toggle_seen_current(self):
         cur = self.list.current()
@@ -3403,7 +3472,10 @@ class App:
                 _time.sleep(0.2)
         except curses.error:
             pass
-        worker.join(timeout=8)                       # ensure the wipe actually finished
+        # emergency_wipe() crypto-erases first (creds + vault/keyrings), so the irreversible
+        # part lands within ~1 s; join returns as soon as the whole wipe finishes (1-2 s more),
+        # making this 20 s cap a safety ceiling rather than a typical wait.
+        worker.join(timeout=20)                      # ensure the wipe actually finished
         try:
             log.append((f"[{_time.time() - t0:5.2f}s] "
                         + _("✗ FAILED: {e}", e="[Errno 101] Network is unreachable"),
@@ -3849,7 +3921,8 @@ class App:
         curses.curs_set(0)
         while True:
             h, w = self.stdscr.getmaxyx()
-            self._bar(h - 1, f" {question}  [y/N] ", self._cp(C_WARN) | curses.A_REVERSE | curses.A_BOLD)
+            self._bar(h - 1, _(" {question}  [y/N] ", question=question),
+                      self._cp(C_WARN) | curses.A_REVERSE | curses.A_BOLD)
             self.stdscr.refresh()
             k = self._getkey()
             if k is None:
@@ -3952,20 +4025,25 @@ class App:
             "  c             compose a new message\n"
             "  r / R / f     reply / reply to all / forward\n"
             "  a             archive        d / Del: trash\n"
-            "  M             move to a folder\n"
+            "  M             move to a folder      z: undo the last move\n"
             "  Space         mark read / unread\n"
+            "  C             address book (contacts)\n"
             "  / u           search · filter unread\n"
             "  n             check for new mail (silent auto-poll every 5 min)\n"
-            "  g             go to the accounts/folders pane\n\n"
+            "  g             go to the accounts/folders pane\n"
+            "  In a mail:    s save attachments · v verify a changed key\n\n"
             "Configuration (menu m → ⚙, or direct shortcuts)\n"
             "  s             edit the account signature\n"
             "  A             switch account\n"
             "  N             add a new account\n\n"
             "Editing (compose)\n"
             "  Tab           next field   (Shift+Tab: previous)\n"
+            "  ^E            encryption: auto → forced → off\n"
+            "  ^F            choose the sending account (From)\n"
             "  ^T            format: auto-detect → plain text → Markdown→HTML (default: auto)\n"
             "  ^O            attach a file (browser: cd, ls, ⇥ completes)\n"
             "  ^X            remove the last attachment\n"
+            "  ^A            encryption help\n"
             "  ^G            send\n"
             "  Esc           quit: Discard / Save the draft / Back\n\n"
             "  q             quit fmail"

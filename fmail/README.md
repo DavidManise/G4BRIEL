@@ -12,7 +12,7 @@ offline-friendly browsing of your whole mailbox.
 Written in plain Python (standard library only) + the system `gpg`. **No pip
 dependencies.** Runs on **Linux and macOS**.
 
-> Status: **0.9.1-beta**. Works daily, but still a beta — back up anything you
+> Status: **0.9.3-beta**. Works daily, but still a beta — back up anything you
 > care about and report rough edges.
 
 ## Install

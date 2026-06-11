@@ -17,6 +17,11 @@ from pathlib import Path
 
 import fmail
 import fmail_tui
+import vault as _v
+
+# Keep duress/wipe regressions fast: scrypt cost (vault.KDF_N) is a production constant,
+# not what these tests check. Lower it in-process.
+_v.KDF_N = 1 << 14
 
 
 class _FakeSock:
@@ -426,52 +431,138 @@ def test_close_cache_no_freeze():
         a._sync_lock.release()
 
 
+def _gpg(home, *args, **kw):
+    import subprocess
+    env = {"PATH": os.environ.get("PATH", ""), "LC_ALL": "C", "GNUPGHOME": str(home)}
+    return subprocess.run(["gpg", "--homedir", str(home), "--batch", "--no-tty", "--quiet",
+                           "--no-options", "--pinentry-mode", "loopback", "--passphrase", ""] + list(args),
+                          capture_output=True, env=env, **kw)
+
+
+def _make_release_key(home, uid="fmail test <t@example.org>"):
+    """Generate an ephemeral ed25519 signing key; return (armored_public_key, fingerprint)."""
+    os.makedirs(home, exist_ok=True); os.chmod(home, 0o700)
+    _gpg(home, "--quick-generate-key", uid, "ed25519", "sign", "never", check=True, timeout=60)
+    cols = _gpg(home, "--list-keys", "--with-colons").stdout.decode()
+    fpr = next(line.split(":")[9] for line in cols.splitlines() if line.startswith("fpr"))
+    pub = _gpg(home, "--armor", "--export", uid).stdout.decode()
+    return pub, fpr
+
+
 def test_self_update():
-    """In-app update: SHA-256 verified, all-or-nothing, config NEVER clobbered, hostile
-    manifest names ignored. Served from a local file:// 'release' (no network)."""
+    """In-app update: SIGNATURE-verified (pinned key) THEN SHA-256 verified, all-or-nothing,
+    config NEVER clobbered, hostile manifest names ignored, fail-closed on a missing/forged
+    signature. Served from a local file:// 'release' (no network)."""
     import hashlib
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
-        remote = d / "release"; remote.mkdir()
-        app = d / "app"; app.mkdir()
-        data = d / "data"; data.mkdir()
-        (app / "fmail.py").write_text("# OLD program\n")
-        keep_cfg = data / "accounts.toml"; keep_cfg.write_text("[accounts.me]\n")  # must survive
-        # build the 'release'
-        newpy = "# NEW program v9\n"
-        (remote / "fmail.py").write_text(newpy)
-        (remote / "VERSION").write_text("9.9.9-beta\n")
-        (remote / "accounts.toml.example").write_text("# new template\n")
-        def sha(p):
-            return hashlib.sha256(p.read_bytes()).hexdigest()
-        sums = "".join(f"{sha(remote/n)}  {n}\n" for n in ("fmail.py", "VERSION", "accounts.toml.example"))
-        sums += "deadbeef" * 8 + "  ../../etc/evil\n"        # hostile name → must be ignored
-        sums += hashlib.sha256(b"x").hexdigest() + "  evil.sh\n"  # non-fmail kind → ignored
-        (remote / "SHA256SUMS").write_text(sums)
-        base = "file://" + str(remote)
+        khome = d / "relkey"
+        pub, fpr = _make_release_key(khome)
+        saved = (fmail.RELEASE_PUBKEY, fmail.RELEASE_FPR)
+        fmail.RELEASE_PUBKEY, fmail.RELEASE_FPR = pub, fpr        # pin the ephemeral key
 
-        # check_update: remote differs from our version → not up to date
-        ver, uptodate = fmail.check_update(base)
-        assert ver == "9.9.9-beta" and uptodate is False
-        # self_update installs the new files
-        newv = fmail.self_update(app, data, base)
-        assert newv == "9.9.9-beta"
-        assert (app / "fmail.py").read_text() == newpy           # program replaced
-        assert (app / "VERSION").read_text().strip() == "9.9.9-beta"
-        assert (data / "accounts.toml.example").read_text() == "# new template\n"
-        assert keep_cfg.read_text() == "[accounts.me]\n"         # CONFIG NOT clobbered
-        assert not (app / "evil.sh").exists() and not (d / "etc").exists()  # hostile names ignored
-
-        # all-or-nothing: a corrupted manifest entry aborts WITHOUT writing anything
-        (app / "fmail.py").write_text("# OLD again\n")
-        bad = sums.replace(sha(remote / "fmail.py"), "0" * 64)   # wrong hash for fmail.py
-        (remote / "SHA256SUMS").write_text(bad)
+        def sign(p):                                             # detached-sign p -> p.asc
+            asc = Path(str(p) + ".asc")
+            if asc.exists():
+                asc.unlink()
+            _gpg(khome, "--armor", "--detach-sign", "-o", str(asc), str(p), check=True)
         try:
-            fmail.self_update(app, data, base)
-            raise AssertionError("checksum mismatch not detected")
-        except fmail.FmailError:
-            pass
-        assert (app / "fmail.py").read_text() == "# OLD again\n"  # untouched on failure
+            remote = d / "release"; remote.mkdir()
+            app = d / "app"; app.mkdir()
+            data = d / "data"; data.mkdir()
+            (app / "fmail.py").write_text("# OLD program\n")
+            keep_cfg = data / "accounts.toml"; keep_cfg.write_text("[accounts.me]\n")  # must survive
+            newpy = "# NEW program v9\n"
+            (remote / "fmail.py").write_text(newpy)
+            (remote / "VERSION").write_text("9.9.9-beta\n")
+            (remote / "accounts.toml.example").write_text("# new template\n")
+
+            def sha(p):
+                return hashlib.sha256(p.read_bytes()).hexdigest()
+            sums = "".join(f"{sha(remote/n)}  {n}\n" for n in ("fmail.py", "VERSION", "accounts.toml.example"))
+            sums += "deadbeef" * 8 + "  ../../etc/evil\n"        # hostile name → must be ignored
+            sums += hashlib.sha256(b"x").hexdigest() + "  evil.sh\n"  # non-fmail kind → ignored
+            (remote / "SHA256SUMS").write_text(sums)
+            sign(remote / "SHA256SUMS")
+            base = "file://" + str(remote)
+
+            # check_update: remote differs from our version → not up to date
+            ver, uptodate = fmail.check_update(base)
+            assert ver == "9.9.9-beta" and uptodate is False
+            # self_update installs the new files (signature + checksums OK)
+            newv = fmail.self_update(app, data, base)
+            assert newv == "9.9.9-beta"
+            assert (app / "fmail.py").read_text() == newpy           # program replaced
+            assert (app / "VERSION").read_text().strip() == "9.9.9-beta"
+            assert (data / "accounts.toml.example").read_text() == "# new template\n"
+            assert keep_cfg.read_text() == "[accounts.me]\n"         # CONFIG NOT clobbered
+            assert not (app / "evil.sh").exists() and not (d / "etc").exists()  # hostile names ignored
+
+            # FAIL-CLOSED 1: missing signature → refused, nothing written
+            (app / "fmail.py").write_text("# OLD again\n")
+            (remote / "SHA256SUMS.asc").unlink()
+            try:
+                fmail.self_update(app, data, base)
+                raise AssertionError("missing release signature accepted")
+            except fmail.FmailError:
+                pass
+            assert (app / "fmail.py").read_text() == "# OLD again\n"
+            sign(remote / "SHA256SUMS")                              # restore a valid signature
+
+            # FAIL-CLOSED 2: forged manifest (content changed, old signature no longer matches)
+            (remote / "SHA256SUMS").write_text(sums.replace("fmail.py", "fmail.py "))  # any byte change
+            try:
+                fmail.self_update(app, data, base)
+                raise AssertionError("forged (re-written, unsigned) manifest accepted")
+            except fmail.FmailError:
+                pass
+            assert (app / "fmail.py").read_text() == "# OLD again\n"
+
+            # all-or-nothing: a corrupted manifest entry (validly SIGNED) aborts on checksum,
+            # writing nothing
+            bad = sums.replace(sha(remote / "fmail.py"), "0" * 64)   # wrong hash for fmail.py
+            (remote / "SHA256SUMS").write_text(bad)
+            sign(remote / "SHA256SUMS")                              # validly signed, but a hash is wrong
+            try:
+                fmail.self_update(app, data, base)
+                raise AssertionError("checksum mismatch not detected")
+            except fmail.FmailError:
+                pass
+            assert (app / "fmail.py").read_text() == "# OLD again\n"  # untouched on failure
+        finally:
+            fmail.RELEASE_PUBKEY, fmail.RELEASE_FPR = saved
+
+
+def test_release_signature_pinning():
+    """The detached-signature verifier accepts ONLY a signature from the pinned key over the
+    exact bytes: a different key, a wrong pinned fingerprint, or altered bytes are rejected.
+    Ephemeral keys; the production constants are sane (40-hex fpr + armored public block)."""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        pubA, fprA = _make_release_key(d / "A", "key A <a@x>")
+        pubB, fprB = _make_release_key(d / "B", "key B <b@x>")
+        msg = b"the signed manifest\n"
+        mp = d / "m"; mp.write_bytes(msg)
+        _gpg(d / "A", "--armor", "--detach-sign", "-o", str(d / "mA.asc"), str(mp), check=True)
+        _gpg(d / "B", "--armor", "--detach-sign", "-o", str(d / "mB.asc"), str(mp), check=True)
+        sigA = (d / "mA.asc").read_bytes()
+        sigB = (d / "mB.asc").read_bytes()
+        saved = (fmail.RELEASE_PUBKEY, fmail.RELEASE_FPR)
+        try:
+            fmail.RELEASE_PUBKEY, fmail.RELEASE_FPR = pubA, fprA
+            assert fmail._gpg_verify_detached(pubA, msg, sigA) is True          # right key, right bytes
+            assert fmail._gpg_verify_detached(pubA, msg + b"x", sigA) is False  # altered bytes
+            assert fmail._gpg_verify_detached(pubA, msg, sigB) is False         # signature from another key
+            fmail.RELEASE_FPR = "0" * 40
+            assert fmail._gpg_verify_detached(pubA, msg, sigA) is False         # wrong pinned fingerprint
+        finally:
+            fmail.RELEASE_PUBKEY, fmail.RELEASE_FPR = saved
+    assert len(fmail.RELEASE_FPR) == 40 and all(c in "0123456789ABCDEFabcdef" for c in fmail.RELEASE_FPR)
+    assert "PGP PUBLIC KEY BLOCK" in fmail.RELEASE_PUBKEY
+    # self_update is actually wired to verify the signature before trusting the manifest
+    import inspect
+    su = inspect.getsource(fmail.self_update)
+    assert "_gpg_verify_detached" in su and "SHA256SUMS.asc" in su
 
 
 def test_update_dev_guard_source():
@@ -506,6 +597,28 @@ def test_mouse_reporting_disabled():
     body = src.split("def _getkey", 1)[1].split("\n    def ", 1)[0]   # the whole _getkey method
     assert "curses.KEY_MOUSE" in body and "curses.getmouse()" in body
     assert "self._mouse_off()" in src.split("def main", 1)[1][:400]
+
+
+def test_ergonomics_guards():
+    """Destructive mail actions are guarded while the folders pane has focus; the last move is
+    undoable (z) via Message-ID; and the CLI composer drafts in RAM-backed tmpfs, not on disk."""
+    src = Path("fmail_tui.py").read_text(encoding="utf-8")
+    # archive / trash / move route through the focus guard (refuses while focus == "folders")
+    assert "_require_mail_focus" in src
+    guard = src.split("def _require_mail_focus", 1)[1].split("\n    def ", 1)[0]
+    assert 'self.focus == "folders"' in guard
+    act = src.split("def _mail_action", 1)[1].split("\n    def ", 1)[0]
+    assert act.count("_require_mail_focus()") >= 3              # archive + trash + move
+    # undo: bound to z, records the move, reverses it by Message-ID
+    assert 'elif k == "z"' in act and "_undo_last_move" in act
+    am = src.split("def _action_move(self", 1)[1].split("\n    def ", 1)[0]
+    assert "self.last_move = {" in am and "_uid_msgid" in am
+    undo = src.split("def _undo_last_move", 1)[1].split("\n    def ", 1)[0]
+    assert "Message-ID" in undo and "_do_move" in undo
+    # CLI compose drafts in RAM-backed tmpfs (/dev/shm) when available, never on a persistent disk
+    fsrc = Path("fmail.py").read_text(encoding="utf-8")
+    eb = fsrc.split("def edit_body", 1)[1].split("\ndef ", 1)[0]
+    assert "SHM_DIR" in eb and "dir=tmpdir" in eb
 
 
 def main():

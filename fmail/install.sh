@@ -21,6 +21,23 @@ BIN_DIR="${FMAIL_BIN:-$HOME/.local/bin}"
 DATA_DIR="${FMAIL_DATA:-$HOME/freyja-mail}"
 MIN_PY_MINOR=11                          # fmail needs Python 3.11+ (tomllib)
 
+# Pinned fmail release signing key (ed25519). The signed SHA256SUMS is the root of trust:
+# the installer verifies it (when gpg is present) before trusting any downloaded file.
+FMAIL_RELEASE_FPR="FB67AAB3077A7D1FE2912D241789A63411D480BE"
+FMAIL_RELEASE_PUBKEY="$(cat <<'PUBKEY'
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEaisKhRYJKwYBBAHaRw8BAQdAfho32qVRzUJAs0K0CNHl1EbNhBRy6EuxuydW
+RNJ6Lfu0MmZtYWlsIHJlbGVhc2Ugc2lnbmluZyBrZXkgPGZtYWlsQHN1cnZpdm9s
+b2dpZS5vcmc+iJMEExYKADsWIQT7Z6qzB3p9H+KRLSQXiaY0EdSAvgUCaisKhQIb
+AwULCQgHAgIiAgYVCgkICwIEFgIDAQIeBwIXgAAKCRAXiaY0EdSAvoe/AQDHn4jf
+Hz9dr/XRqnud5RLQIMS39GCVxNgWsQCoLQyORwEAuXXAz4RN9Bp0NbaIa52wtHMz
+AWKmmY35xdZUlUoz7QI=
+=YyWj
+-----END PGP PUBLIC KEY BLOCK-----
+PUBKEY
+)"
+
 info() { printf '  \033[1;34m>\033[0m %s\n' "$*"; }
 ok()   { printf '  \033[1;32mok\033[0m %s\n' "$*"; }
 warn() { printf '  \033[1;33m!\033[0m %s\n' "$*" >&2; }
@@ -116,6 +133,28 @@ fetch() { # <relpath> <dest>
 
 info "Source: ${FMAIL_SRC:-$FMAIL_BASE_URL}"
 fetch "SHA256SUMS" "$TMP/SHA256SUMS" || die "cannot retrieve the file manifest (SHA256SUMS)."
+
+# 4b. ROOT OF TRUST: verify the manifest's signature against the pinned release key BEFORE
+#     trusting anything in it. Skipped for a local FMAIL_SRC (already-trusted copy). If gpg
+#     is missing we can't verify it — warn and fall back to checksums (the in-app updater,
+#     which always has gpg, stays strictly fail-closed).
+if [ -z "$FMAIL_SRC" ]; then
+  if have gpg; then
+    fetch "SHA256SUMS.asc" "$TMP/SHA256SUMS.asc" || die "cannot retrieve the release signature (SHA256SUMS.asc)."
+    GH="$TMP/gpgsig"; mkdir -p "$GH"; chmod 700 "$GH"
+    printf '%s\n' "$FMAIL_RELEASE_PUBKEY" | gpg --homedir "$GH" --batch --quiet --import 2>/dev/null \
+      || die "could not load the fmail release key."
+    if gpg --homedir "$GH" --batch --no-tty --status-fd=1 --verify \
+           "$TMP/SHA256SUMS.asc" "$TMP/SHA256SUMS" 2>/dev/null | grep -q "VALIDSIG $FMAIL_RELEASE_FPR"; then
+      ok "release signature verified (key ${FMAIL_RELEASE_FPR:0:16}…)"
+    else
+      die "INVALID release signature — aborting. Do NOT trust this download."
+    fi
+  else
+    warn "gpg absent — CANNOT verify the release signature (falling back to checksums only)."
+  fi
+fi
+
 while read -r _sum name; do
   [ -n "${name:-}" ] || continue
   fetch "$name" "$TMP/$name" || die "cannot retrieve $name"

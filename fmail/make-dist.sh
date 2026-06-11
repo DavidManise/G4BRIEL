@@ -48,6 +48,21 @@ done
   done > SHA256SUMS
 )
 echo "Wrote $OUT/SHA256SUMS"
+
+# --- sign the manifest with the pinned release key (root of trust for the updater) -------
+# The signed SHA256SUMS is what fmail >=0.9.3 verifies against its embedded RELEASE_PUBKEY
+# before trusting any downloaded file. The secret key lives ONLY here (never shipped).
+RELEASE_GNUPGHOME="${FMAIL_RELEASE_GNUPGHOME:-$HOME/secrets/fmail-release}"
+if gpg --homedir "$RELEASE_GNUPGHOME" --list-secret-keys >/dev/null 2>&1; then
+  rm -f "$OUT/SHA256SUMS.asc"
+  gpg --homedir "$RELEASE_GNUPGHOME" --batch --pinentry-mode loopback --passphrase '' \
+      --armor --detach-sign -o "$OUT/SHA256SUMS.asc" "$OUT/SHA256SUMS"
+  echo "Signed  $OUT/SHA256SUMS.asc  (release key $(gpg --homedir "$RELEASE_GNUPGHOME" \
+        --list-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}'))"
+else
+  echo "WARNING: release key absent from $RELEASE_GNUPGHOME — SHA256SUMS NOT signed." >&2
+  echo "         fmail >=0.9.3 will REFUSE this release. Build on the release host." >&2
+fi
 echo
 echo "Next: upload the *contents* of $OUT/ to https://survivologie.org/fmail/"
 echo "Users then run:  curl -fsSL https://survivologie.org/fmail/install.sh | bash"

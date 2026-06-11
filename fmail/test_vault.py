@@ -12,6 +12,11 @@ from pathlib import Path
 
 import vault as v
 
+# These tests exercise the vault LOGIC (sealing, KDF migration, duress), not the raw
+# scrypt cost — which is a production constant (vault.KDF_N). Lower it in-process so the
+# suite stays fast; the migration test still asserts n >= 1<<14.
+v.KDF_N = 1 << 14
+
 
 def main():
     with tempfile.TemporaryDirectory() as d:
@@ -151,6 +156,7 @@ def main():
             pass
 
     _test_kdf_and_migration()
+    _test_kdf_strengthen()
     _test_truncated_envelope()
     _test_duress()
     print("✅ test_vault : tous les tests passent (fichiers/GNUPGHOME temporaires)")
@@ -270,6 +276,33 @@ def _test_kdf_and_migration():
             raise AssertionError("après migration, slot encore ouvrable au mdp brut")
         except v.BadPassphrase:
             pass
+
+
+def _test_kdf_strengthen():
+    """Renforcement transparent : un coffre fmt 3 scellé sous une KDF PLUS FAIBLE que
+    KDF_N courant est re-scellé au déverrouillage (suite à un bump de paramètres), sans
+    toucher la DEK ni le corps. Fichiers TEMPORAIRES."""
+    import base64
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "vault.gpg"
+        home = Path(d) / "gnupg"
+        MP = "Mot-De-Passe-Maitre-A-Renforcer-7"
+        v.create(MP, accounts={"k": "v"}, path=path, home=home)   # n = KDF_N (abaissé en test)
+        env = json.loads(path.read_bytes().decode("utf-8"))
+        dek = v._unwrap_password(env, MP, home)
+        # re-scelle le slot mot de passe sous une KDF strictement plus faible (n = KDF_N/2)
+        weak = {"algo": "scrypt", "n": v.KDF_N >> 1, "r": v.KDF_R, "p": v.KDF_P,
+                "salt": base64.b64encode(os.urandom(16)).decode("ascii")}
+        env["kdf"] = weak
+        env["slots"]["password"] = v._wrap(dek, v._kdf_passphrase(MP, weak), home)
+        v._write_cipher(json.dumps(env).encode("utf-8"), path)
+        assert json.loads(path.read_bytes())["kdf"]["n"] == (v.KDF_N >> 1)
+        # déverrouillage → renforcement transparent jusqu'à KDF_N, DEK préservée
+        assert v.unlock(MP, path=path, home=home)["accounts"]["k"] == "v"
+        v.lock()
+        after = json.loads(path.read_bytes().decode("utf-8"))
+        assert after["kdf"]["n"] >= v.KDF_N, f"KDF non renforcée: {after['kdf']['n']}"
+        assert v.read_vault(MP, path, home)["accounts"]["k"] == "v"   # toujours ouvrable
 
 
 def _test_truncated_envelope():
