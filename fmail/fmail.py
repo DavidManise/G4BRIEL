@@ -24,6 +24,7 @@ import argparse
 import base64
 import email
 import email.errors
+import email.policy
 import getpass
 import html as _html
 import imaplib
@@ -51,7 +52,7 @@ from email.utils import (formataddr, formatdate, getaddresses, make_msgid,
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.9.3-beta"
+__version__ = "0.9.4-beta"
 
 CONFIG_PATH = Path(os.environ.get("FMAIL_CONFIG", Path.home() / "freyja-mail" / "accounts.toml"))
 STATE_PATH = Path.home() / "freyja-mail" / ".fmail_state.json"
@@ -666,10 +667,15 @@ def imap_connect(acc: Account) -> imaplib.IMAP4_SSL:
             pass
         die(_("IMAP certificate for {host} CHANGED — connection refused (accept the "
               "new certificate in the TUI alert).", host=acc.imap_host))
+    # imaplib encodes LOGIN args with M._encoding (ASCII by default): a non-ASCII
+    # password (e.g. one containing "ñ") raises UnicodeEncodeError mid-login. Send the
+    # credentials as UTF-8 so 8-bit passwords work; catch UnicodeError too so a bad
+    # password can never crash the caller (or a background poll/sync thread).
+    M._encoding = "utf-8"
     try:
         M.login(acc.email, acc.password())
         return M
-    except (imaplib.IMAP4.error, OSError, ssl.SSLError) as e:
+    except (imaplib.IMAP4.error, OSError, ssl.SSLError, UnicodeError) as e:
         die(_("IMAP connection failed ({email}): {e}", email=acc.email, e=e))
 
 
@@ -1130,6 +1136,15 @@ def _attach_file(msg: EmailMessage, path: str) -> None:
         data = p.read_bytes()
     except OSError as e:
         die(_("attachment unreadable ({path}): {e}", path=p, e=e))
+    if maintype == "message" and subtype == "rfc822":
+        # A message/rfc822 part (e.g. a forwarded .eml) MUST embed a parsed message,
+        # not raw bytes: add_attachment(bytes, maintype="message") base64-encodes the
+        # payload, which RFC 2046 §5.2.1 forbids on message/* — standards-compliant
+        # recipients then decode an empty/blank message. Embedding the parsed object
+        # yields a 7bit/8bit part that round-trips intact.
+        inner = email.message_from_bytes(data, policy=email.policy.default)
+        msg.add_attachment(inner, filename=p.name)
+        return
     msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=p.name)
 
 

@@ -9,7 +9,7 @@ message editor. Reuses the fmail engine (IMAP/SMTP) — only the primitives that
 do NOT print (a print() would break the curses screen).
 
 Security: confirmations kept (trash/move/send). Opening a mail marks it read
-(\\Seen); Space toggles read/unread. A silent poll checks INBOX every 5 min
+(\\Seen); Space toggles selection (bulk actions), x toggles read/unread. A silent poll checks INBOX every 5 min
 (no notification) and shows a "new mail" badge; "n" forces an immediate check.
 """
 from __future__ import annotations
@@ -532,6 +532,11 @@ class App:
         self._bar_from = "mails"
         self._special_cache = {}
         self.last_move = None  # {"msgid","src","dest","info"} of the last move, for undo (z)
+        # ── Multi-selection (bulk actions on the mail list) ───────────────
+        # tagged_uids: the UIDs the user has tagged with Space for a bulk action.
+        # Per (account, folder): cleared on switch, on a filter change, and after a
+        # destructive bulk action.
+        self.tagged_uids = set()
         # ── Silent poll of new mail (INBOX) ──────────────────────────────
         self.new_count = 0          # new INBOX mails since the last glance
         self.inbox_total = 0
@@ -939,6 +944,41 @@ class App:
                     self.list._clamp()
                     break
 
+    # ── Multi-selection (bulk actions) ────────────────────────────────────
+    # Selection = a set of tagged UIDs (Space toggles the current mail). UID-based
+    # so it survives a background re-list/reorder. There is no range gesture: this
+    # terminal cannot tell Shift+arrow from a plain arrow, so we keep it simple —
+    # tag mails one by one with Space, then act on the lot.
+    def _selection_uids(self):
+        """Tagged UIDs still present in the current list (stale tags are pruned)."""
+        return self.tagged_uids & {s.uid for s in self.list.items}
+
+    def _selected_in_order(self):
+        """Selected UIDs in list (display) order — [] when nothing is selected."""
+        sel = self._selection_uids()
+        return [s.uid for s in self.list.items if s.uid in sel]
+
+    def _clear_selection(self):
+        self.tagged_uids = set()
+
+    def _has_selection(self):
+        # Based on the EFFECTIVE (visible) selection, not raw tags: a stale tag whose
+        # mail has left the list must not make Esc swallow a phantom selection instead
+        # of clearing the active search/filter.
+        return bool(self._selection_uids())
+
+    def _toggle_select_current(self):
+        """Space: add/remove the current mail from the selection."""
+        if self.focus != "mails":
+            return
+        cur = self.list.current()
+        if not cur:
+            return
+        if cur.uid in self.tagged_uids:
+            self.tagged_uids.discard(cur.uid)
+        else:
+            self.tagged_uids.add(cur.uid)
+
 
     # Compact button bar (quick reference). "m Menu" opens the full dropdown menu;
     # every shortcut also works directly everywhere.
@@ -957,7 +997,8 @@ class App:
         (_("Open mail"), "\n"), (_("Reply"), "r"), (_("Reply to all"), "R"),
         (_("Forward"), "f"), (_("Compose"), "c"), (_("Archive"), "a"),
         (_("Move to trash"), "d"), (_("Move…"), "M"), (_("Undo last move"), "z"),
-        (_("Mark read / unread"), " "), (_("Search"), "/"), (_("Filter unread"), "u"),
+        (_("Select / unselect (bulk)"), " "), (_("Mark read / unread"), "x"),
+        (_("Search"), "/"), (_("Filter unread"), "u"),
         (_("Check for new mail"), "n"), (_("Address book"), "C"),
         (_("⚙ Configuration ▸"), "__config__"),
         (_("General help"), "?"),
@@ -1086,7 +1127,9 @@ class App:
             if self._enter() == "quit":
                 return "quit"
         elif is_esc(k):
-            if self.search_query or self.only_unseen:
+            if self._has_selection():
+                self._clear_selection()
+            elif self.search_query or self.only_unseen:
                 self.search_query = ""
                 self.only_unseen = False
                 self.refresh_list()
@@ -1154,6 +1197,7 @@ class App:
             self.folder = f
             self.search_query = ""
             self.only_unseen = False
+            self._clear_selection()                       # UIDs are per-folder
             self._active = (self.acc.name, self.folder)   # target read by the sync thread
             self.refresh_list()
             self.list.home()      # focus on the MOST RECENT message (top of list)
@@ -1174,6 +1218,7 @@ class App:
         self.folder = "INBOX"
         self.search_query = ""
         self.only_unseen = False
+        self._clear_selection()  # UIDs are per-account/folder
         self._active = (self.acc.name, self.folder)
         self.load_folders()      # rebuilds the tree (new account expanded)
         self._reset_poll()       # the prominent badge rebases onto the new account
@@ -1237,7 +1282,7 @@ class App:
         for part in msg.walk():
             if "attachment" in (part.get("Content-Disposition") or "").lower():
                 try:
-                    data = part.get_payload(decode=True) or b""
+                    data = self._part_bytes(part)
                     if tmpdir is None:
                         tmpdir = tempfile.mkdtemp(prefix="fmail-draft-")
                     p = self._write_attachment(tmpdir, part.get_filename(), data)
@@ -1274,38 +1319,48 @@ class App:
         elif k == "s":
             self._edit_signature()
         elif k in ("r", "R", "f"):
-            cur = self.list.current()
-            if cur:
-                # Pre-arm encryption if the mail is encrypted (cached lock): replying
-                # from the LIST must be fail-closed like from the reader (otherwise a
-                # reply to an encrypted exchange would go out in cleartext).
-                # CAUTIOUS FAIL-CLOSED: a still-UNPROBED status (encrypted=None) is
-                # treated as encrypted — we only downgrade to cleartext if the mail is
-                # CONFIRMED unencrypted.
-                self._reply_or_forward(cur.uid, kind=k,
-                                       encrypted=(getattr(cur, "encrypted", False) is not False))
+            # Forward acts on the selection (as .eml attachments) whenever one is active —
+            # like d/a/M/Space; reply/reply-all always act on the current mail.
+            if k == "f" and self._selected_in_order():
+                if self._require_mail_focus():
+                    self._forward_selected()
+            else:
+                cur = self.list.current()
+                if cur:
+                    # Pre-arm encryption if the mail is encrypted (cached lock): replying
+                    # from the LIST must be fail-closed like from the reader (otherwise a
+                    # reply to an encrypted exchange would go out in cleartext).
+                    # CAUTIOUS FAIL-CLOSED: a still-UNPROBED status (encrypted=None) is
+                    # treated as encrypted — we only downgrade to cleartext if the mail is
+                    # CONFIRMED unencrypted.
+                    self._reply_or_forward(cur.uid, kind=k,
+                                           encrypted=(getattr(cur, "encrypted", False) is not False))
+        elif k == "x":
+            if self._require_mail_focus():
+                self._toggle_seen_selected()
         elif k == "a":
             if self._require_mail_focus():
-                self._action_move_current(self._special("archive"), _("Archive"))
+                self._action_move_selected(self._special("archive"), _("Archive"))
         elif k in ("d", curses.KEY_DC):
             if self._require_mail_focus():
-                self._action_move_current(self._special("trash"), _("Move to trash"))
+                self._action_move_selected(self._special("trash"), _("Move to trash"))
         elif k == "m":
             sel = self._open_menu()
             if sel is not None:
                 return self._trigger(sel)
         elif k == "M":
             if self._require_mail_focus():
-                self._move_to_folder_current()
+                self._move_selected_to_folder()
         elif k == "z":
             self._undo_last_move()
         elif k == " ":
-            self._toggle_seen_current()
+            self._toggle_select_current()
         elif k == "/":
             self._search_prompt()
         elif k == "u":
             self.only_unseen = not self.only_unseen
             self.search_query = ""
+            self._clear_selection()   # the visible set changes → don't keep hidden tags
             self.refresh_list()
         elif k == "n":
             self._check_now()
@@ -1399,6 +1454,7 @@ class App:
         # Mail pane
         mx, mw = fw + 2, max(0, w - (fw + 2))
         self.list.set_height(max(1, pane_h - 1))
+        sel = self._selection_uids()              # UIDs picked for bulk actions
         total, unread = self._cur_counts          # local cache counts
         fshort = self.folder.replace("INBOX.", "") or "INBOX"
         mtitle = _("{folder} · {total} msg · {unread} unread",
@@ -1412,22 +1468,30 @@ class App:
             mtitle += f"  /{self.search_query}"
         if self.only_unseen:
             mtitle += "  " + _("[unread]")
+        if sel:
+            mtitle += "  " + _("✓{n} selected", n=len(sel))
         self._put(body_top, mx, mtitle[:mw],
                   self._cp(C_TITLE) | curses.A_BOLD | (curses.A_REVERSE if self.focus == "mails" else 0))
         if not self.summaries:
             self._put(body_top + 1, mx, _("(empty)")[:mw], self._cp(C_DIM))
         for i, (idx, s) in enumerate(self.list.visible()):
+            marked = s.uid in sel
+            mk = "▌" if marked else " "          # gutter bar on selected rows
             dot = "●" if not s.seen else " "
             lk = "🔒" if s.encrypted else "  "   # lock if encrypted (PGP/MIME)
             # date + time (date_fmt = "YYYY-MM-DD HH:MM"); fixed width for alignment.
             # The sender column widens on roomy panes (≥96 cols), staying 16 on narrow ones.
             fw = 16 if mw < 96 else min(28, max(16, mw // 4))
-            line = f"{dot}{lk} {s.date_fmt[:16]:<16} {s.from_display[:fw]:<{fw}} {s.subject or _('(no subject)')}"
+            line = f"{mk}{dot}{lk} {s.date_fmt[:16]:<16} {s.from_display[:fw]:<{fw}} {s.subject or _('(no subject)')}"
             is_sel = (idx == self.list.cursor)
             if is_sel and self.focus == "mails":
                 attr = curses.A_REVERSE | curses.A_BOLD
             elif is_sel:
                 attr = self._cp(C_TITLE) | curses.A_BOLD
+            elif marked:
+                # selected but not the cursor: accent + bold + underline so the lot stands
+                # out AND reads differently from an (also-green) encrypted row.
+                attr = self._cp(C_ACCENT) | curses.A_BOLD | curses.A_UNDERLINE
             else:
                 # encrypted → GREEN; otherwise unread → bold white, read → dim green.
                 base = (self._cp(C_ACCENT) if s.encrypted
@@ -1855,6 +1919,21 @@ class App:
             i += 1
         return Path(destdir) / f"{stem} ({i}){ext}"
 
+    @staticmethod
+    def _part_bytes(part):
+        """Raw bytes of an attachment part. A message/rfc822 part (e.g. a forwarded .eml)
+        returns None from get_payload(decode=True), which would silently write an EMPTY
+        file — so for those we serialize the embedded message instead, so a forwarded mail
+        round-trips intact through draft re-edit, "save attachment", and re-forward."""
+        if part.get_content_type() == "message/rfc822":
+            payload = part.get_payload()
+            if isinstance(payload, list) and payload:
+                return payload[0].as_bytes()
+            if hasattr(payload, "as_bytes"):
+                return payload.as_bytes()
+            return part.as_bytes()
+        return part.get_payload(decode=True) or b""
+
     def _write_attachment(self, destdir, fname, data):
         """Writes an attachment safely: sanitized name (basename, anti path-traversal),
         unique path, EXCLUSIVE creation at 0600 — never an overwrite, never readable by
@@ -1890,7 +1969,7 @@ class App:
         saved = 0
         for fn, part in chosen:
             try:
-                self._write_attachment(destdir, fn, part.get_payload(decode=True))
+                self._write_attachment(destdir, fn, self._part_bytes(part))
                 saved += 1
             except OSError as e:
                 self.error(_("failed to save {fn}: {e}", fn=fn, e=e))
@@ -1920,7 +1999,7 @@ class App:
                 tmpdir = tempfile.mkdtemp(prefix="fmail-fwd-")
                 for fn, part in parts:
                     try:
-                        p = self._write_attachment(tmpdir, fn, part.get_payload(decode=True))
+                        p = self._write_attachment(tmpdir, fn, self._part_bytes(part))
                         cs.attachments.append(str(p))
                     except OSError:
                         pass
@@ -2537,9 +2616,15 @@ class App:
         (imaplib is not thread-safe)."""
         try:
             while not self._poll_stop.is_set():
-                self._sync_active_folder()
-                self._poll_check()
-                self._poll_all_status()
+                try:
+                    self._sync_active_folder()
+                    self._poll_check()
+                    self._poll_all_status()
+                except Exception as e:
+                    # A background pass must NEVER crash this daemon thread nor dump a
+                    # traceback over the curses UI (it would garble the screen while the
+                    # app keeps running). Record it discreetly and keep polling.
+                    self.poll_error = str(e)
                 self._sync_wake.wait(POLL_INTERVAL_S)
                 self._sync_wake.clear()
         finally:
@@ -2697,13 +2782,19 @@ class App:
 
     def _wait_key_or_timeout(self, ms):
         """Waits for a key, or unblocks on its own after `ms` ms (None on timeout)."""
-        self.stdscr.timeout(ms)
+        try:
+            self.stdscr.timeout(ms)
+        except curses.error:
+            pass
         self._raw_key = True          # this timeout wins: _getkey doesn't arm its own
         try:
             return self._getkey()
         finally:
             self._raw_key = False
-            self.stdscr.timeout(-1)
+            try:
+                self.stdscr.timeout(-1)
+            except curses.error:
+                pass
 
     def _verbose_check(self, folder=None, full=True, title=None):
         """Syncs the folder in the FOREGROUND while showing a verbose log (connection,
@@ -2820,6 +2911,62 @@ class App:
         if dest and self._action_move(cur.uid, dest, _("Move")):
             self._refresh_all()
 
+    def _action_move_selected(self, dest, verb):
+        """Bulk archive/trash/move of the current selection. Falls back to the single
+        current mail when nothing is selected (unchanged single-mail behaviour)."""
+        uids = self._selected_in_order()
+        if not uids:
+            self._action_move_current(dest, verb)
+            return
+        if not dest:
+            self.error(_("destination folder not found (configure it in accounts.toml)."))
+            return
+        if dest == self.folder:
+            # In-place move (e.g. 'd' while viewing Trash): a same-folder MOVE would purge
+            # the cache rows for mails that actually stay on the server. Refuse it instead.
+            self.status = _("already in {dest}.", dest=dest)
+            self._clear_selection()
+            return
+        if not self.confirm(_("{verb} → {dest}?   ({n} messages)", verb=verb, dest=dest, n=len(uids))):
+            return
+        src = self.folder
+        total = len(uids)
+        by_uid = {s.uid: s for s in self.list.items}
+        step, finish = self._progress_logger(_("⟩⟩ {verb} → {dest}", verb=verb, dest=dest))
+        moved = failed = 0
+        for i, uid in enumerate(uids, 1):
+            s = by_uid.get(uid)
+            label = (getattr(s, "subject", "") or _("(no subject)"))[:48] if s else str(uid)
+            step(_("[{i}/{n}] {label}…", i=i, n=total, label=label))
+            try:
+                self._do_move(uid, src, dest)
+                moved += 1
+                step(_("[{i}/{n}] ✓ {label}", i=i, n=total, label=label), "ok", replace=True)
+            except NET_ERRORS as e:
+                failed += 1
+                step(_("[{i}/{n}] ✗ {label} — {e}", i=i, n=total, label=label, e=e),
+                     "error", replace=True)
+        # Undo (z) only tracks a single message: a bulk move clears it rather than
+        # offer a misleading "undo" that would bring back only the last one.
+        self.last_move = None
+        self._clear_selection()
+        if failed:
+            summary = _("✓ {n} moved to {dest} · {f} failed", n=moved, dest=dest, f=failed)
+        else:
+            summary = _("✓ {n} messages moved to {dest}", n=moved, dest=dest)
+        finish(summary, failed)
+        self.status = summary
+        self._refresh_all()
+
+    def _move_selected_to_folder(self):
+        """'M' on a selection: pick one destination, then bulk-move the whole lot."""
+        if not self._selected_in_order():
+            self._move_to_folder_current()
+            return
+        dest = self._pick_folder(_("Move to which folder?"))
+        if dest:
+            self._action_move_selected(dest, _("Move"))
+
     def _require_mail_focus(self):
         """Guard for the mail-targeting actions (archive/trash/move): refuse them while the
         focus is on the folders pane, where the user means to act on a FOLDER, not on the
@@ -2898,6 +3045,120 @@ class App:
             self.folder_counts[self.folder] = (msg, un + 1)
         self._relist()
 
+    def _toggle_seen_selected(self):
+        """Bulk mark read/unread. Target state: if any selected mail is unread → mark
+        all read; otherwise mark all unread. Single-mail fallback unchanged. The
+        selection is kept (non-destructive: you may chain another action)."""
+        uids = self._selected_in_order()
+        if not uids:
+            self._toggle_seen_current()
+            return
+        by_uid = {s.uid: s for s in self.list.items}
+        new_seen = any(not by_uid[u].seen for u in uids if u in by_uid)
+        try:
+            with self._imap() as M:
+                fmail.imap_select(M, self.folder, readonly=False)
+                op = "+FLAGS" if new_seen else "-FLAGS"
+                M.uid("store", ",".join(uids), op, "(\\Seen)")
+        except NET_ERRORS as e:
+            self.error(str(e))
+            return
+        with self._flag_lock:   # don't get overwritten by the worker's reconciliation
+            for u in uids:
+                s = by_uid.get(u)
+                if s is None or s.seen == new_seen:
+                    continue
+                s.seen = new_seen
+                self.store.set_flag(self.acc.name, self.folder, u, seen=new_seen)
+                if new_seen:
+                    self._dec_unseen(self.folder)
+                else:
+                    msg, un = self.folder_counts.get(self.folder, (0, 0))
+                    self.folder_counts[self.folder] = (msg, un + 1)
+        self.status = _("✓ {n} messages marked {state}", n=len(uids),
+                        state=_("read") if new_seen else _("unread"))
+        self._relist()
+
+    def _forward_selected(self):
+        """Bulk forward: the selected mails are attached as .eml files to a single new
+        message. Encrypted mails are forwarded as-is (their ciphertext stays sealed)."""
+        uids = self._selected_in_order()
+        by_uid = {s.uid: s for s in self.list.items}
+        if len(uids) <= 1:
+            # 0 or 1 selected → ordinary single forward (the selected mail if any, else
+            # the cursor). Acts on the SELECTED mail — not the cursor — when one is tagged.
+            cur = self.list.current()
+            uid = uids[0] if uids else (cur.uid if cur else None)
+            if uid:
+                s = by_uid.get(uid)
+                self._reply_or_forward(uid, kind="f",
+                                       encrypted=(getattr(s, "encrypted", False) is not False))
+            self._clear_selection()
+            return
+        n_enc = sum(1 for u in uids if getattr(by_uid.get(u), "encrypted", False))
+        prompt = _("Forward {n} messages as attachments?", n=len(uids))
+        if n_enc:
+            prompt += " " + _("({e} are encrypted — forwarded sealed.)", e=n_enc)
+        if not self.confirm(prompt):
+            return
+        tmpdir = tempfile.mkdtemp(prefix="fmail-fwd-")
+        cs = ComposeState(subject=_("Fwd: {n} messages", n=len(uids)), body=self._sig_block())
+        used = set()
+        skipped = 0
+        total = len(uids)
+        # step-only: no finish() — the fetch popup is immediately superseded by the
+        # composer (or by error()/confirm() on the early-return paths), which redraw the
+        # whole screen, so there is no "done" popup to close here.
+        step = self._progress_logger(_("⟩⟩ Forward {n} messages", n=total))[0]
+        try:
+            with self._imap() as M:
+                fmail.imap_select(M, self.folder, readonly=True)
+                for i, uid in enumerate(uids, 1):
+                    s = by_uid.get(uid)
+                    label = (getattr(s, "subject", "") or _("(no subject)"))[:48] if s else str(uid)
+                    step(_("[{i}/{n}] {label}…", i=i, n=total, label=label))
+                    try:
+                        msg = fmail.fetch_message(M, uid)
+                    except NET_ERRORS:
+                        skipped += 1
+                        step(_("[{i}/{n}] ✗ {label}", i=i, n=total, label=label), "error", replace=True)
+                        continue   # missing/oversized mail: skip it, forward the rest
+                    subj = fmail.decode_field(msg.get("Subject")) or _("message")
+                    name = self._eml_filename(subj, used)
+                    try:
+                        (Path(tmpdir) / name).write_bytes(msg.as_bytes())
+                    except OSError:
+                        skipped += 1
+                        step(_("[{i}/{n}] ✗ {label}", i=i, n=total, label=label), "error", replace=True)
+                        continue
+                    cs.attachments.append(str(Path(tmpdir) / name))
+                    step(_("[{i}/{n}] ✓ {label}", i=i, n=total, label=label), "ok", replace=True)
+            if not cs.attachments:
+                self.error(_("could not fetch the selected messages."))
+                return
+            # Some mails dropped out (oversized / vanished): say so, let the user abort —
+            # the recipient would otherwise silently never receive them.
+            if skipped and not self.confirm(
+                    _("{k} message(s) could not be fetched — forward the {n} others anyway?",
+                      k=skipped, n=len(cs.attachments))):
+                return
+            self.compose_loop(cs)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            self._clear_selection()
+
+    @staticmethod
+    def _eml_filename(subject, used):
+        """A safe, unique '<subject>.eml' name for a temp forward attachment."""
+        base = re.sub(r"[^\w\-. ]", "_", subject).strip().strip(".")[:60] or "message"
+        name = f"{base}.eml"
+        i = 2
+        while name in used:
+            name = f"{base}-{i}.eml"
+            i += 1
+        used.add(name)
+        return name
+
     def _peek(self, uid):
         try:
             with self._imap() as M:
@@ -2918,6 +3179,7 @@ class App:
         q = q.strip()
         self.search_query = q
         self.only_unseen = False
+        self._clear_selection()   # the visible set changes → don't keep hidden tags
         if q:
             # SERVER-SIDE full-text search (matches the body too). It runs synchronously
             # and can take a few seconds (a server without an FTS index scans every body),
@@ -3838,7 +4100,12 @@ class App:
         """Framed, centered modal window (terminal/phosphor style). Each line can be a
         str (default color) or a (text, attr) pair to color it (e.g. an alert in red).
         Keeps the LAST lines if it overflows."""
-        self.stdscr.erase()
+        # erase()/refresh() can raise curses.error on a resize mid-draw; a progress popup
+        # is redrawn in a loop and must never let that crash the action or skip cleanup.
+        try:
+            self.stdscr.erase()
+        except curses.error:
+            pass
         h, w = self.stdscr.getmaxyx()
         cp = self._cp(C_ACCENT)
         norm = [(str(t), a) for (t, a) in (ln if isinstance(ln, tuple) else (ln, cp)
@@ -3862,7 +4129,10 @@ class App:
             self._put(by + bh - 2, bx, "│ " + footer.ljust(bw - 4)[:bw - 4] + " │",
                       cp | curses.A_BOLD)
         self._put(by + bh - 1, bx, "└" + "─" * (bw - 2) + "┘", cp | curses.A_BOLD)
-        self.stdscr.refresh()
+        try:
+            self.stdscr.refresh()
+        except curses.error:
+            pass
 
     def _wait_key(self):
         while True:
@@ -3916,6 +4186,37 @@ class App:
             self._popup_box(_("⟩⟩ TRANSMISSION — FAILED"), log, footer=_("[Enter] close"))
             self._wait_key()
             return False
+
+    def _progress_logger(self, title):
+        """Verbose progress popup for a slow bulk action, in the same style as the mail
+        check. Returns (step, finish):
+          step(text, level="info", replace=False) — add a log line (or rewrite the last
+              one, e.g. to turn "… in progress" into "✓ done") and redraw the popup;
+          finish(summary, failed) — append the summary, then auto-dismiss after 1.5 s on
+              full success, or wait for a key if some items failed.
+        Keeps the user informed during the N server round-trips (otherwise the UI looks
+        frozen while messages are deleted/moved one by one server-side)."""
+        log = []
+
+        def step(text, level="info", replace=False):
+            line = (text, self._lvl_attr(level))
+            if replace and log:
+                log[-1] = line
+            else:
+                log.append(line)
+            self._popup_box(title, log, footer=_("· in progress ·"))
+
+        def finish(summary, failed):
+            log.append((summary, self._lvl_attr("warn" if failed else "ok")))
+            self._popup_box(title + _(" — done"), log,
+                            footer=(_("[Enter] close") if failed
+                                    else _("(Enter, or closes by itself)")))
+            if failed:
+                self._wait_key()
+            else:
+                self._wait_key_or_timeout(1500)
+
+        return step, finish
 
     def confirm(self, question):
         curses.curs_set(0)
@@ -4017,7 +4318,7 @@ class App:
             "  Enter         on an ACCOUNT → switch + open its INBOX; on a FOLDER → open it;\n"
             "                on a MAIL → open it (a draft opens in edit mode)\n"
             "  PgUp PgDn     page · Home/End\n"
-            "  Esc           clear the search\n\n"
+            "  Esc           clear the selection, then the search\n\n"
             "Menu\n"
             "  m             open/close the dropdown menu (ALL functions)\n"
             "                → contains the \"⚙ Configuration\" sub-menu\n\n"
@@ -4026,12 +4327,16 @@ class App:
             "  r / R / f     reply / reply to all / forward\n"
             "  a             archive        d / Del: trash\n"
             "  M             move to a folder      z: undo the last move\n"
-            "  Space         mark read / unread\n"
+            "  x             mark read / unread\n"
             "  C             address book (contacts)\n"
             "  / u           search · filter unread\n"
             "  n             check for new mail (silent auto-poll every 5 min)\n"
             "  g             go to the accounts/folders pane\n"
             "  In a mail:    s save attachments · v verify a changed key\n\n"
+            "Multi-selection (mail list)\n"
+            "  Space         select / unselect the current mail\n"
+            "  d a M f        then act on ALL selected mails (else the current one)\n"
+            "  Esc           clear the selection\n\n"
             "Configuration (menu m → ⚙, or direct shortcuts)\n"
             "  s             edit the account signature\n"
             "  A             switch account\n"

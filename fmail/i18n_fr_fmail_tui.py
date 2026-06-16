@@ -346,6 +346,34 @@ CATALOG = {
     "Move to which folder?": "Déplacer vers quel dossier ?",
     "Move": "Déplacer",
 
+    # ── Multi-selection (bulk actions) ─────────────────────────────────────
+    "Select / unselect (bulk)": "Cocher / décocher (lot)",
+    "✓{n} selected": "✓{n} sélectionnés",
+    "{verb} → {dest}?   ({n} messages)": "{verb} → {dest} ?   ({n} messages)",
+    "✓ {n} messages moved to {dest}": "✓ {n} messages déplacés vers {dest}",
+    "✓ {n} moved to {dest} · {f} failed": "✓ {n} déplacés vers {dest} · {f} en échec",
+    "✓ {n} messages marked {state}": "✓ {n} messages marqués {state}",
+    "read": "lus",
+    "unread": "non lus",
+    "Forward {n} messages as attachments?":
+        "Transférer {n} messages en pièces jointes ?",
+    "({e} are encrypted — forwarded sealed.)":
+        "({e} sont chiffrés — transférés scellés.)",
+    "Fwd: {n} messages": "Tr : {n} messages",
+    "message": "message",
+    "could not fetch the selected messages.":
+        "impossible de récupérer les messages sélectionnés.",
+    "⟩⟩ {verb} → {dest}": "⟩⟩ {verb} → {dest}",
+    "⟩⟩ Forward {n} messages": "⟩⟩ Transfert de {n} messages",
+    " — done": " — terminé",
+    "[{i}/{n}] {label}…": "[{i}/{n}] {label}…",
+    "[{i}/{n}] ✓ {label}": "[{i}/{n}] ✓ {label}",
+    "[{i}/{n}] ✗ {label}": "[{i}/{n}] ✗ {label}",
+    "[{i}/{n}] ✗ {label} — {e}": "[{i}/{n}] ✗ {label} — {e}",
+    "{k} message(s) could not be fetched — forward the {n} others anyway?":
+        "{k} message(s) n'ont pas pu être récupérés — transférer les {n} autres quand même ?",
+    "already in {dest}.": "déjà dans {dest}.",
+
     # ── Search & pickers ───────────────────────────────────────────────────
     "Search: ": "Recherche : ",
     "Searching “{q}” on the server…": "Recherche de « {q} » sur le serveur…",
@@ -593,7 +621,7 @@ CATALOG = {
     "  Enter         on an ACCOUNT → switch + open its INBOX; on a FOLDER → open it;\n"
     "                on a MAIL → open it (a draft opens in edit mode)\n"
     "  PgUp PgDn     page · Home/End\n"
-    "  Esc           clear the search\n\n"
+    "  Esc           clear the selection, then the search\n\n"
     "Menu\n"
     "  m             open/close the dropdown menu (ALL functions)\n"
     "                → contains the \"⚙ Configuration\" sub-menu\n\n"
@@ -602,12 +630,16 @@ CATALOG = {
     "  r / R / f     reply / reply to all / forward\n"
     "  a             archive        d / Del: trash\n"
     "  M             move to a folder      z: undo the last move\n"
-    "  Space         mark read / unread\n"
+    "  x             mark read / unread\n"
     "  C             address book (contacts)\n"
     "  / u           search · filter unread\n"
     "  n             check for new mail (silent auto-poll every 5 min)\n"
     "  g             go to the accounts/folders pane\n"
     "  In a mail:    s save attachments · v verify a changed key\n\n"
+    "Multi-selection (mail list)\n"
+    "  Space         select / unselect the current mail\n"
+    "  d a M f        then act on ALL selected mails (else the current one)\n"
+    "  Esc           clear the selection\n\n"
     "Configuration (menu m → ⚙, or direct shortcuts)\n"
     "  s             edit the account signature\n"
     "  A             switch account\n"
@@ -630,7 +662,7 @@ CATALOG = {
         "  Entrée        sur un COMPTE → bascule + ouvre son INBOX ; sur un DOSSIER → l'ouvre ;\n"
         "                sur un MAIL → l'ouvre (un brouillon s'ouvre en édition)\n"
         "  PgUp PgDn     page · Début/Fin\n"
-        "  Échap         vider la recherche\n\n"
+        "  Échap         vider la sélection, puis la recherche\n\n"
         "Menu\n"
         "  m             ouvrir/fermer le menu déroulant (TOUTES les fonctions)\n"
         "                → contient le sous-menu « ⚙ Configuration »\n\n"
@@ -639,12 +671,16 @@ CATALOG = {
         "  r / R / f     répondre / répondre à tous / transférer\n"
         "  a             archiver        d / Suppr : corbeille\n"
         "  M             déplacer vers un dossier   z : annuler le dernier déplacement\n"
-        "  Espace        marquer lu / non-lu\n"
+        "  x             marquer lu / non-lu\n"
         "  C             carnet d'adresses (contacts)\n"
         "  / u           rechercher · filtrer non-lus\n"
         "  n             vérifier les nouveaux mails (poll auto silencieux toutes les 5 min)\n"
         "  g             aller au volet comptes/dossiers\n"
         "  Dans un mail :s enregistrer les PJ · v vérifier une clé changée\n\n"
+        "Multi-sélection (liste des mails)\n"
+        "  Espace        cocher / décocher le mail courant\n"
+        "  d a M f        agissent sur TOUS les mails cochés (sinon le courant)\n"
+        "  Échap         vider la sélection\n\n"
         "Configuration (menu m → ⚙, ou raccourcis directs)\n"
         "  s             éditer la signature du compte\n"
         "  A             changer de compte\n"
