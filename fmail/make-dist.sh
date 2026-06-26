@@ -14,13 +14,16 @@ APP=(fmail.py fmail_tui.py fmail_store.py vault.py autocrypt.py
      i18n_fr_vault.py i18n_fr_autocrypt.py i18n_fr_fmail_store.py)
 OPT=()
 DOCS=(README.md LICENSE install.sh uninstall.sh VERSION accounts.toml.example)
-TESTS=(test_autocrypt.py test_vault.py test_security.py test_i18n.py)
+TESTS=(test_autocrypt.py test_autocrypt_dek.py test_vault.py test_security.py test_i18n.py)
 
 # --- never-ship guard: secret / personal patterns ------------------------
 SECRET_GLOBS=('vault.gpg' 'vault.gpg.lock' 'accounts.toml' 'sent.log' 'check.log'
               'notified_uids.txt' '*.bak-*' '.autocrypt.db' '.tls_pins.json'
               '.fmail_cache.db*' '.gnupg-*' 'config.py' 'inbox.py' 'read.py'
-              'check_new.py' 'drafts' 'signatures')
+              'check_new.py' 'drafts' 'signatures'
+              # byte-compiled artifacts embed the maintainer's absolute home path
+              # (co_filename) → must never ship in a public release.
+              '__pycache__' '*.pyc')
 
 rm -rf "$OUT"; mkdir -p "$OUT"
 copy() { if [ -f "$1" ]; then cp "$1" "$OUT/"; echo "  + $1"; fi; }

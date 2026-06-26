@@ -10,6 +10,12 @@ CATALOG = {
     "gpg: not found": "gpg: introuvable",
     "key generation failed: {err}": "génération de clé échouée : {err}",
     "key generated but not found afterwards": "clé générée mais introuvable ensuite",
+    "vault locked: unlock it before migrating the keys.":
+        "coffre verrouillé : déverrouille-le avant de migrer les clés.",
+    "re-seal of {fpr} failed: {err} — restore the backup.":
+        "le re-scellement de {fpr} a échoué : {err} — restaure la sauvegarde.",
+    "migration verification failed for {n} key(s) — restore the backup.":
+        "vérification de migration échouée pour {n} clé(s) — restaure la sauvegarde.",
     "key export failed: {err}": "export de clé échoué : {err}",
     "peer key rejected (non-conforming structure/UID)":
         "clé de pair refusée (structure/UID non conformes)",

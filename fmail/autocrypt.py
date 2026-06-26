@@ -46,30 +46,93 @@ class AutocryptError(Exception):
 
 
 # ─── isolated gpg ────────────────────────────────────────────────────────────
-def _gpg(args: list[str], home: Path, stdin: bytes | None = None) -> tuple[int, bytes, bytes]:
+def _gpg(args: list[str], home: Path, stdin: bytes | None = None,
+         passphrase: str | None = None) -> tuple[int, bytes, bytes]:
     """Run gpg in the `home` keyring. Never interactive (loopback), never network,
     never blocking (timeout). MINIMAL environment (no http_proxy nor inherited
     secrets; C locale for a stable stderr). The `[GNUPG:]` machine status we parse
-    is itself locale-independent."""
+    is itself locale-independent.
+
+    `passphrase` (when not None) is fed to gpg via a dedicated pipe FD — NEVER argv,
+    NEVER disk (mirrors vault._gpg_pw). It unlocks DEK-protected secret keys for the
+    keygen/sign/decrypt ops; None keeps the legacy passphrase-less path byte-for-byte.
+    NB: a passphrase-LESS key harmlessly ignores a supplied passphrase, so callers may
+    always pass the DEK without branching on whether a given key is migrated yet."""
+    # Self-enforce the no-cache invariant: write the TTL=0 gpg-agent.conf and kill any
+    # stale agent BEFORE this call can start one. Without this, the FIRST gpg op in a
+    # process (e.g. decrypt_message on the read path, which does not go through ensure_key)
+    # would spin up an agent under the DEFAULT 600 s TTL; it would then serve a cached
+    # secret key even after the vault re-locks → fail-OPEN. ensure_home is idempotent.
+    ensure_home(home)
     env = {"GNUPGHOME": str(home), "PATH": os.environ.get("PATH", ""), "LC_ALL": "C"}
     cmd = ["gpg", "--batch", "--no-tty", "--quiet", "--yes",
            "--no-options",                  # ignore any gpg.conf dropped into the home
            "--no-auto-key-locate", "--no-auto-key-retrieve",
            "--disable-dirmngr",             # 100% local: no network call (WKD/keyserver/dirmngr)
-           "--pinentry-mode", "loopback"] + args
+           "--pinentry-mode", "loopback"]
+    r = None
+    pass_fds = ()
+    if passphrase is not None:
+        r, w = os.pipe()
+        try:
+            os.write(w, passphrase.encode("utf-8"))
+        finally:
+            os.close(w)
+        cmd += ["--passphrase-fd", str(r)]
+        pass_fds = (r,)
+    cmd += args
     try:
         p = subprocess.run(cmd, input=stdin, capture_output=True, env=env,
-                           timeout=GPG_TIMEOUT)
+                           pass_fds=pass_fds, timeout=GPG_TIMEOUT)
     except subprocess.TimeoutExpired:
         return 124, b"", _("gpg: timed out").encode()
     except FileNotFoundError:
         return 127, b"", _("gpg: not found").encode()
+    finally:
+        if r is not None:
+            os.close(r)
     return p.returncode, p.stdout, p.stderr
 
 
 def ensure_home(home: Path = AUTOCRYPT_HOME) -> None:
     home.mkdir(parents=True, exist_ok=True)
     os.chmod(home, 0o700)
+    # Stop gpg-agent from caching a DEK-unlocked secret key across operations: with a
+    # cache, a later op while the vault is LOCKED (no DEK) would still succeed from the
+    # cache, silently defeating the lock. TTL=0 + ignore-cache-for-signing force every
+    # op to re-supply the passphrase via our loopback FD. (--no-symkey-cache would NOT
+    # help — that is the SYMMETRIC cache; this is the agent's secret-key cache.)
+    conf = home / "gpg-agent.conf"
+    desired = ("default-cache-ttl 0\n"
+               "max-cache-ttl 0\n"
+               "ignore-cache-for-signing\n"
+               "allow-loopback-pinentry\n")
+    try:
+        if not conf.exists() or conf.read_text() != desired:
+            # Atomic write (tmp + replace) so a concurrent first-run never sees a torn conf.
+            tmp = conf.with_suffix(".conf.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(desired)
+            os.replace(tmp, conf)
+            # The agent reads this only at startup → restart any stale agent so TTL=0
+            # takes effect at once (a no-op on a fresh home).
+            subprocess.run(["gpgconf", "--homedir", str(home), "--kill", "gpg-agent"],
+                           capture_output=True)
+    except OSError:
+        pass
+
+
+def _key_passphrase() -> str | None:
+    """Passphrase protecting the Autocrypt SECRET keys: the vault's session DEK when a
+    vault is unlocked, else None — no-vault mode keeps passphrase-less keys (legacy),
+    and a locked vault yields None so secret-key ops fail closed (never cleartext).
+    vault is imported lazily to avoid an import cycle (fmail.emergency_wipe imports us)."""
+    try:
+        import vault
+        return vault.session_dek()
+    except Exception:
+        return None
 
 
 def _secret_fpr(email: str, home: Path) -> str | None:
@@ -92,16 +155,118 @@ def ensure_key(email: str, name: str = "", home: Path = AUTOCRYPT_HOME) -> str:
     if fpr:
         return fpr
     uid = f"{name} <{email}>" if name else f"<{email}>"
-    rc, _out, err = _gpg(
-        ["--passphrase", "", "--quick-generate-key", uid, "default", "default", "never"],
-        home,
-    )
+    pp = _key_passphrase()
+    gen = ["--quick-generate-key", uid, "default", "default", "never"]
+    if pp is None:
+        # No vault → legacy passphrase-less key (exact prior behavior: empty passphrase
+        # on argv, protected by the 0700 keyring + ecryptfs — the Autocrypt model).
+        rc, _out, err = _gpg(["--passphrase", ""] + gen, home)
+    else:
+        # Vault unlocked → seal the new secret key under the DEK (fed via FD, not argv).
+        rc, _out, err = _gpg(gen, home, passphrase=pp)
     if rc != 0:
         raise AutocryptError(_("key generation failed: {err}", err=err.decode(errors='replace')))
     fpr = _secret_fpr(email, home)
     if not fpr:
         raise AutocryptError(_("key generated but not found afterwards"))
     return fpr
+
+
+def _all_secret_fprs(home: Path) -> list[str]:
+    """Primary fingerprints of every SECRET key in the keyring."""
+    rc, out, _ = _gpg(["--list-secret-keys", "--with-colons"], home)
+    if rc != 0:
+        return []
+    fprs, want = [], False
+    for line in out.decode(errors="replace").splitlines():
+        if line.startswith("sec:"):
+            want = True
+        elif line.startswith("fpr:") and want:
+            fprs.append(line.split(":")[9])
+            want = False
+    return fprs
+
+
+def _unprotected_key_files(home: Path) -> list[str]:
+    """Secret-key files lacking the `protected-private-key` marker. NB: this file marker
+    is necessary but NOT sufficient (it can read PROT on a key that still signs with an
+    empty passphrase) — _unprotected_fprs() is the authoritative, behavioral check."""
+    d = home / "private-keys-v1.d"
+    out = []
+    if d.is_dir():
+        for k in sorted(d.glob("*.key")):
+            try:
+                if b"protected-private-key" not in k.read_bytes():
+                    out.append(k.name)
+            except OSError:
+                out.append(k.name)
+    return out
+
+
+def _kill_agent(home: Path) -> None:
+    """Drop the agent's cached passphrases so a protection check is honest."""
+    subprocess.run(["gpgconf", "--homedir", str(home), "--kill", "gpg-agent"],
+                   capture_output=True)
+
+
+def _unprotected_fprs(fprs: list[str], home: Path) -> list[str]:
+    """Authoritative protection probe: a key is UNPROTECTED iff EITHER keygrip still works
+    with an EMPTY passphrase (agent cache killed first) — the signing primary (sign probe)
+    OR the encryption subkey (encrypt-to-self then decrypt probe). Probing only signing
+    would miss a half-protected key whose enc subkey is still passphrase-less. Returns the
+    unprotected fingerprints."""
+    bad = []
+    for fpr in fprs:
+        # Signing primary: an empty-passphrase signature that succeeds = unprotected.
+        _kill_agent(home)
+        rc, _o, _e = _gpg(["--armor", "--detach-sign", "--local-user", fpr],
+                          home, stdin=b"probe", passphrase="")
+        if rc == 0:
+            bad.append(fpr)
+            continue
+        # Encryption subkey: encrypt to self (public op, no secret key), then try to
+        # decrypt with an EMPTY passphrase — success means the enc subkey is unprotected.
+        rc_e, ct, _e2 = _gpg(["--armor", "--encrypt", "--trust-model", "always",
+                              "--recipient", fpr], home, stdin=b"probe")
+        if rc_e == 0 and ct:
+            _kill_agent(home)
+            rc_d, out, _e3 = _gpg(["--decrypt"], home, stdin=ct, passphrase="")
+            if rc_d == 0 and out:
+                bad.append(fpr)
+    return bad
+
+
+def migrate_secret_keys(dek: str, home: Path = AUTOCRYPT_HOME) -> dict:
+    """Re-seal every Autocrypt SECRET key IN PLACE under `dek` (the vault DEK), via
+    `gpg --passwd` (FD-fed, never argv). In-place: fingerprints are preserved, so mail
+    received before migration still decrypts. Idempotent: a fully-protected keyring is a
+    no-op. The result is VERIFIED behaviorally (an empty passphrase must no longer sign);
+    on any failure it raises WITHOUT having destroyed key material (--passwd never deletes
+    the key) — the CALLER should still keep its keyring backup until this returns OK.
+
+    Returns {"keys": n, "resealed": m}. Raises AutocryptError if `dek` is empty/locked or
+    if verification fails."""
+    if not dek:
+        raise AutocryptError(_("vault locked: unlock it before migrating the keys."))
+    ensure_home(home)
+    fprs = _all_secret_fprs(home)
+    if not fprs:
+        return {"keys": 0, "resealed": 0}
+    if not _unprotected_key_files(home) and not _unprotected_fprs(fprs, home):
+        return {"keys": len(fprs), "resealed": 0}      # already fully protected → no-op
+    resealed = 0
+    for fpr in fprs:
+        _kill_agent(home)                              # old passphrase is empty; no cache
+        rc, _o, err = _gpg(["--passwd", fpr], home, passphrase=dek)
+        if rc != 0:
+            raise AutocryptError(_("re-seal of {fpr} failed: {err} — restore the backup.",
+                                   fpr=fpr, err=err.decode(errors='replace')[-150:]))
+        resealed += 1
+    still = _unprotected_fprs(fprs, home)
+    if still:
+        raise AutocryptError(_("migration verification failed for {n} key(s) — restore "
+                               "the backup.", n=len(still)))
+    return {"keys": len(fprs), "resealed": resealed}
 
 
 def export_pubkey(email: str, home: Path = AUTOCRYPT_HOME) -> bytes:
@@ -473,7 +638,10 @@ def _gpg_encrypt(data: bytes, recipient_fprs: list[str], sender_fpr: str, home: 
             "--trust-model", "always"]
     for r in dict.fromkeys(recipient_fprs):     # dedupe while keeping order
         args += ["--recipient", r]
-    rc, out, err = _gpg(args, home, stdin=data)
+    # Signing unlocks the sender's secret key → feed the DEK. A passphrase-less key
+    # ignores it (compat); a DEK-protected key with the vault locked → rc≠0 → raises
+    # below → fail-closed (the send is refused, never sent in cleartext).
+    rc, out, err = _gpg(args, home, stdin=data, passphrase=_key_passphrase())
     if rc != 0 or not out:
         raise AutocryptError(_("encryption failed: {err}", err=err.decode(errors='replace')))
     return out
@@ -601,7 +769,11 @@ def decrypt_message(msg, home: Path = AUTOCRYPT_HOME):
     data = epart.get_payload(decode=True)     # applies the CTE → raw armor bytes
     if not data:
         return fail(_("empty encrypted part"))
-    rc, out, err = _gpg(["--status-fd", "2", "--decrypt"], home, stdin=data)
+    # Decryption unlocks the recipient secret key → feed the DEK (ignored by a
+    # passphrase-less key; a DEK-protected key with the vault locked yields no
+    # DECRYPTION_OKAY below → fail(), never a false "decrypted").
+    rc, out, err = _gpg(["--status-fd", "2", "--decrypt"], home, stdin=data,
+                        passphrase=_key_passphrase())
     lines = _status_lines(err)
 
     def has(tok):

@@ -67,7 +67,7 @@ def _gpg_pw(args: list[str], passphrase: str, stdin: bytes, home: Path) -> tuple
     finally:
         os.close(w)
     cmd = ["gpg", "--batch", "--no-tty", "--quiet", "--yes", "--no-options",
-           "--disable-dirmngr", "--pinentry-mode", "loopback",
+           "--disable-dirmngr", "--no-symkey-cache", "--pinentry-mode", "loopback",
            "--passphrase-fd", str(r), "--homedir", str(home)] + args
     env = {"PATH": os.environ.get("PATH", ""), "LC_ALL": "C"}
     try:
@@ -516,8 +516,21 @@ def is_unlocked() -> bool:
     return _state["data"] is not None
 
 
+def session_dek() -> str | None:
+    """The session Data-Encryption-Key (64-hex) while the vault is unlocked, else None.
+    High-entropy and stable across master-password changes — used to passphrase-protect
+    the Autocrypt secret keys at rest. None in no-vault mode or when locked."""
+    return _state.get("dek")
+
+
 def lock() -> None:
-    """Lock: wipe secrets and data key from the process memory."""
+    """Lock: drop the in-memory references to the decrypted vault and the data key.
+
+    This does NOT scrub the secrets from RAM: the DEK and the decrypted data are
+    immutable Python str/dict objects (cannot be overwritten in place), so their
+    contents linger in freed heap memory until garbage collection and reuse. A core
+    dump or a swap-out taken before then could still recover them — fmail.harden_process()
+    (RLIMIT_CORE=0) is the crash-dump mitigation; encrypted swap is the swap one."""
     _state.update(data=None, dek=None, last_active=0.0)
 
 

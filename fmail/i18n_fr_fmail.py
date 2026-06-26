@@ -5,6 +5,22 @@
 
 CATALOG = {
     "[encrypted]": "[chiffré]",
+    "⚠ unencrypted swap ({names}): a crash or memory pressure can page the data "
+    "key and decrypted mail to disk — use encrypted swap or `swapoff`.":
+        "⚠ swap non chiffré ({names}) : un crash ou une pression mémoire peut écrire la "
+        "clé de données et des mails déchiffrés sur le disque — utilise un swap chiffré ou `swapoff`.",
+    "enable “master_password = true” in [security] first.":
+        "active d'abord « master_password = true » dans [security].",
+    "No Autocrypt secret key to protect.": "Aucune clé secrète Autocrypt à protéger.",
+    "Re-seal Autocrypt secret keys under the vault key (DEK). Decrypting/"
+    "signing will then need the vault unlocked. Backup: {b}":
+        "Re-scelle les clés secrètes Autocrypt sous la clé du coffre (DEK). Déchiffrer/"
+        "signer nécessitera alors le coffre déverrouillé. Sauvegarde : {b}",
+    "Proceed? [y/N] ": "Continuer ? [o/N] ",
+    "backup failed ({e}) — aborted.": "échec de la sauvegarde ({e}) — abandon.",
+    "{e}  (keyring backup: {b})": "{e}  (sauvegarde du trousseau : {b})",
+    "✓ {n} Autocrypt key(s) re-sealed under the vault key (backup shredded).":
+        "✓ {n} clé(s) Autocrypt re-scellée(s) sous la clé du coffre (sauvegarde effacée).",
     # ── In-app update ──
     "could not check for updates: {e}": "impossible de vérifier les mises à jour : {e}",
     "could not check for updates: empty version.":

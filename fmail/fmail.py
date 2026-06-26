@@ -52,7 +52,7 @@ from email.utils import (formataddr, formatdate, getaddresses, make_msgid,
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.9.4-beta"
+__version__ = "0.9.5-beta"
 
 CONFIG_PATH = Path(os.environ.get("FMAIL_CONFIG", Path.home() / "freyja-mail" / "accounts.toml"))
 STATE_PATH = Path.home() / "freyja-mail" / ".fmail_state.json"
@@ -90,6 +90,37 @@ class FmailError(Exception):
 
 def die(msg: str, code: int = 1) -> "None":
     raise FmailError(msg, code)
+
+
+def _swap_is_encrypted(dev: str) -> bool:
+    """True only if `dev` is a dm-crypt mapping (its sysfs dm/uuid starts with CRYPT-).
+    A plain partition, an LVM logical volume, or a swapfile returns False — none is a
+    CONFIRMED encrypted swap. Read-only sysfs lookup, no root."""
+    try:
+        base = os.path.basename(os.path.realpath(dev))
+        if not base.startswith("dm-"):
+            return False
+        return Path(f"/sys/block/{base}/dm/uuid").read_text().startswith("CRYPT-")
+    except OSError:
+        return False
+
+
+def swap_warning() -> Optional[str]:
+    """One-line warning if active swap exists and at least one area is not confirmed
+    dm-crypt — the data key and decrypted mail could then be paged to unencrypted disk.
+    Read-only (/proc/swaps + sysfs), no root, Linux-only. None when there is no swap,
+    all swap is encrypted, or the platform can't be inspected (e.g. macOS)."""
+    try:
+        entries = Path("/proc/swaps").read_text().splitlines()[1:]   # drop the header row
+    except OSError:
+        return None
+    unprotected = [parts[0] for parts in (ln.split() for ln in entries)
+                   if parts and not _swap_is_encrypted(parts[0])]
+    if not unprotected:
+        return None
+    names = ", ".join(os.path.basename(d) for d in unprotected)
+    return _("⚠ unencrypted swap ({names}): a crash or memory pressure can page the data "
+             "key and decrypted mail to disk — use encrypted swap or `swapoff`.", names=names)
 
 
 # ─── Accounts ───────────────────────────────────────────────────────────────
@@ -343,7 +374,7 @@ def cli_unlock(retries: int = 3) -> None:
     master_password is active and a vault exists."""
     if vault.is_unlocked():
         return
-    for _ in range(retries):
+    for _attempt in range(retries):
         try:
             pw = getpass.getpass(_("fmail master password: "))
         except (EOFError, KeyboardInterrupt):
@@ -568,6 +599,47 @@ def cmd_vault(args, accounts, default) -> None:
             except OSError as e:
                 err(_("  failed {path}: {e}", path=p, e=e))
         print(c(_("✓ cleartext secrets (identical to the vault) purged — the vault is the source."), "1;32"))
+        return
+
+    if action == "migrate-autocrypt":
+        if not vault.exists():
+            die(_("no vault. “fmail vault init” first."))
+        if not load_security().master_password:
+            die(_("enable “master_password = true” in [security] first."))
+        import autocrypt
+        import shutil
+        home = autocrypt.AUTOCRYPT_HOME
+        # Existence check BEFORE prompting for the master password (it needs no DEK).
+        if not home.exists() or not autocrypt._all_secret_fprs(home):
+            print(_("No Autocrypt secret key to protect."))
+            return
+        cli_unlock()                       # unlock → the DEK is available
+        backup = home.parent / f"{home.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+        print(c(_("Re-seal Autocrypt secret keys under the vault key (DEK). Decrypting/"
+                  "signing will then need the vault unlocked. Backup: {b}", b=backup), "1;33"))
+        try:
+            ans = input(_("Proceed? [y/N] ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(); ans = ""
+        if ans not in ("y", "o", "yes", "oui"):
+            print(_("Cancelled."))
+            return
+        try:
+            shutil.copytree(home, backup)
+            os.chmod(backup, 0o700)
+        except OSError as e:
+            die(_("backup failed ({e}) — aborted.", e=e))
+        try:
+            rep = autocrypt.migrate_secret_keys(vault.session_dek(), home)
+        except autocrypt.AutocryptError as e:
+            # Migration failed/aborted → KEEP the backup so the user can restore.
+            die(_("{e}  (keyring backup: {b})", e=e, b=backup))
+        # Verified OK → shred the backup: it holds the OLD passphrase-less keys, a
+        # cleartext-equivalent secret-key copy we must not leave on disk (a duress wipe
+        # also globs *.bak-*, but don't rely on that). The live keyring is the source.
+        _shred(backup)
+        print(c(_("✓ {n} Autocrypt key(s) re-sealed under the vault key (backup shredded).",
+                  n=rep["resealed"]), "1;32"))
         return
 
 
@@ -1681,6 +1753,16 @@ def emergency_wipe() -> None:
                 tmp_atts += [Path(x) for x in glob.glob(f"{base}/{pat}")]
             except Exception:
                 pass
+    # Autocrypt keyring backups left by `fmail vault migrate-autocrypt`. They hold the
+    # PRE-migration, passphrase-LESS secret keys (usable with no DEK at all), so a panic
+    # wipe MUST shred them too — otherwise the migration would have created a brand-new
+    # cleartext-equivalent key leak that survives the wipe.
+    ac_backups = []
+    try:
+        ac_backups = [Path(x) for x in glob.glob(
+            f"{_ac.AUTOCRYPT_HOME.parent}/{_ac.AUTOCRYPT_HOME.name}.bak-*")]
+    except Exception:
+        pass
     # 2) ORDER: cleartext creds + config + keys FIRST (crypto-erase + shrink the race window),
     #    then the encrypted cache, temp attachments and the rest.
     targets = pw_files + [
@@ -1689,7 +1771,7 @@ def emergency_wipe() -> None:
         _ac.AUTOCRYPT_HOME, _ac.PEERS_DB,
         cfg_dir / ".fmail_cache.db.gpg", cfg_dir / ".fmail_cache.db",
         cfg_dir / ".fmail_cache.db-wal", cfg_dir / ".fmail_cache.db-shm",
-    ] + cache_work + tmp_atts + [SENT_LOG, STATE_PATH, TLS_PINS, SIGNATURE_DIR]
+    ] + cache_work + tmp_atts + ac_backups + [SENT_LOG, STATE_PATH, TLS_PINS, SIGNATURE_DIR]
     for t in targets:
         _shred(t)
 
@@ -2132,9 +2214,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("vault", help=_("Encrypted vault (master password)."))
     sp.add_argument("vault_action",
                     choices=["init", "status", "passwd", "set-password", "recover",
-                             "recovery-code", "duress", "purge-secrets"],
+                             "recovery-code", "duress", "purge-secrets",
+                             "migrate-autocrypt"],
                     help="init | status | passwd | set-password <account> | recover | "
-                         "recovery-code | duress | purge-secrets")
+                         "recovery-code | duress | purge-secrets | migrate-autocrypt")
     sp.add_argument("vault_account", nargs="?", help=_("account (for set-password)."))
     sp.set_defaults(func=cmd_vault)
 
@@ -2194,7 +2277,25 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def harden_process() -> None:
+    """Forbid core dumps for this secret-bearing process: a crash (SIGSEGV/abort/OOM)
+    must never spill the data key, the decrypted vault or mail bodies into a core file
+    on disk. Soft AND hard RLIMIT_CORE are set to 0, so no descendant can re-raise the
+    limit either. Best-effort: a missing primitive or a sandbox refusal must never keep
+    fmail from starting.
+
+    We deliberately do NOT call prctl(PR_SET_DUMPABLE, 0) here: it would also block the
+    user's own gdb/strace on fmail, and same-uid ptrace is already gated by the kernel's
+    yama ptrace_scope. Add it only for belt-and-suspenders on a host with ptrace_scope=0."""
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except Exception:
+        pass
+
+
 def main() -> int:
+    harden_process()             # a crash must not dump the decrypted secrets to disk
     i18n.set_lang(load_lang())   # [ui] lang (or auto-detect) before any message
     args = build_parser().parse_args()
     try:

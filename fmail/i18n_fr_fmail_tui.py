@@ -41,8 +41,8 @@ CATALOG = {
         "l'assistant, ou édite ~/freyja-mail/accounts.toml (voir accounts.toml.example).",
     "No mail account is configured yet.": "Aucun compte mail n'est configuré pour l'instant.",
     "Let's add your first account (IMAP/SMTP).": "Ajoutons ton premier compte (IMAP/SMTP).",
-    "You can add more later with the “N” key, or edit accounts.toml by hand.":
-        "Tu pourras en ajouter d'autres avec la touche « N », ou éditer accounts.toml à la main.",
+    "You can add more later via the menu (m → ⚙ Configuration), or edit accounts.toml by hand.":
+        "Tu pourras en ajouter d'autres via le menu (m → ⚙ Configuration), ou éditer accounts.toml à la main.",
     " Add a mail account": " Ajouter un compte mail",
     "Add an account now?  [Y/n]   (Esc: skip)": "Ajouter un compte maintenant ?  [O/n]   (Échap : passer)",
     " No account added": " Aucun compte ajouté",
@@ -147,6 +147,7 @@ CATALOG = {
     "Search": "Rechercher",
     "Filter unread": "Filtrer non-lus",
     "Check for new mail": "Vérifier les nouveaux mails",
+    "Check all accounts": "Vérifier tous les comptes",
     "🔒 Encryption help (exchange secure mail)":
         "🔒 Aide au chiffrement (échanger des mails sécurisés)",
     "⚙ Configuration ▸": "⚙ Configuration ▸",
@@ -307,6 +308,7 @@ CATALOG = {
 
     # ── Verbose check ──────────────────────────────────────────────────────
     "⟩⟩ MAIL CHECK": "⟩⟩ RELÈVE DU COURRIER",
+    "⟩⟩ MAIL CHECK [{i}/{n}] — {acc}": "⟩⟩ RELÈVE [{i}/{n}] — {acc}",
     "· in progress ·": "· en cours ·",
     "querying the server (SEARCH ALL)…": "interrogation du serveur (SEARCH ALL)…",
     "server ↔ cache diff: {new} new, {deleted} deleted":
@@ -325,6 +327,21 @@ CATALOG = {
     "✗ FAILED: {e}": "✗ ÉCHEC : {e}",
     " — FAILED": " — ÉCHEC",
     "[Enter] close": "[Entrée] fermer",
+
+    # ── Activity strip (live background sync feed) ─────────────────────────
+    " ⟩⟩ Server activity": " ⟩⟩ Activité serveur",
+    "[{acc}] querying server (SEARCH ALL)…":
+        "[{acc}] interrogation serveur (SEARCH ALL)…",
+    "[{acc}] diff: {new} new, {deleted} deleted":
+        "[{acc}] diff : {new} nouveau(x), {deleted} supprimé(s)",
+    "[{acc}] fetching {n} header(s)…": "[{acc}] récupération de {n} en-tête(s)…",
+    "[{acc}] {n} header(s) fetched": "[{acc}] {n} en-tête(s) récupéré(s)",
+    "[{acc}] reconciling flags ({n})…":
+        "[{acc}] réconciliation des indicateurs ({n})…",
+    "[{acc}] sync error: {e}": "[{acc}] erreur de synchro : {e}",
+    "[{acc}] STATUS failed": "[{acc}] STATUS échoué",
+    "[{acc}] STATUS INBOX — OK ({n} unread)":
+        "[{acc}] STATUS INBOX — OK ({n} non lu(s))",
 
     # ── Move actions ───────────────────────────────────────────────────────
     "destination folder not found (configure it in accounts.toml).":
@@ -633,7 +650,8 @@ CATALOG = {
     "  x             mark read / unread\n"
     "  C             address book (contacts)\n"
     "  / u           search · filter unread\n"
-    "  n             check for new mail (silent auto-poll every 5 min)\n"
+    "  n             check for new mail — current account (auto-poll every 5 min)\n"
+    "  N             check ALL accounts (one verbose window per account)\n"
     "  g             go to the accounts/folders pane\n"
     "  In a mail:    s save attachments · v verify a changed key\n\n"
     "Multi-selection (mail list)\n"
@@ -643,7 +661,7 @@ CATALOG = {
     "Configuration (menu m → ⚙, or direct shortcuts)\n"
     "  s             edit the account signature\n"
     "  A             switch account\n"
-    "  N             add a new account\n\n"
+    "  (menu)        add an account (m → ⚙ Configuration)\n\n"
     "Editing (compose)\n"
     "  Tab           next field   (Shift+Tab: previous)\n"
     "  ^E            encryption: auto → forced → off\n"
@@ -674,7 +692,8 @@ CATALOG = {
         "  x             marquer lu / non-lu\n"
         "  C             carnet d'adresses (contacts)\n"
         "  / u           rechercher · filtrer non-lus\n"
-        "  n             vérifier les nouveaux mails (poll auto silencieux toutes les 5 min)\n"
+        "  n             vérifier les nouveaux mails — compte courant (poll auto 5 min)\n"
+        "  N             vérifier TOUS les comptes (une fenêtre verbeuse par compte)\n"
         "  g             aller au volet comptes/dossiers\n"
         "  Dans un mail :s enregistrer les PJ · v vérifier une clé changée\n\n"
         "Multi-sélection (liste des mails)\n"
@@ -684,7 +703,7 @@ CATALOG = {
         "Configuration (menu m → ⚙, ou raccourcis directs)\n"
         "  s             éditer la signature du compte\n"
         "  A             changer de compte\n"
-        "  N             ajouter un nouveau compte\n\n"
+        "  (menu)        ajouter un compte (m → ⚙ Configuration)\n\n"
         "Édition (composer)\n"
         "  Tab           champ suivant   (Maj+Tab : précédent)\n"
         "  ^E            chiffrement : auto → forcé → désactivé\n"

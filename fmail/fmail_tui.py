@@ -10,10 +10,12 @@ do NOT print (a print() would break the curses screen).
 
 Security: confirmations kept (trash/move/send). Opening a mail marks it read
 (\\Seen); Space toggles selection (bulk actions), x toggles read/unread. A silent poll checks INBOX every 5 min
-(no notification) and shows a "new mail" badge; "n" forces an immediate check.
+(no notification) and shows a "new mail" badge; "n" forces an immediate check of the
+current account, "N" checks every account (one verbose window per account, sequential).
 """
 from __future__ import annotations
 
+import collections
 import curses
 import email
 import imaplib
@@ -24,6 +26,7 @@ import shutil
 import ssl
 import tempfile
 import threading
+import time
 import unicodedata
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from pathlib import Path
@@ -351,6 +354,8 @@ C_TITLE, C_ACCENT, C_FROM, C_DIM, C_WARN, C_ERR = 1, 2, 3, 4, 5, 6
 NET_ERRORS = (FmailError, imaplib.IMAP4.error, OSError, ssl.SSLError)
 POLL_INTERVAL_S = 300     # background sync — 5 min
 POLL_UI_TICK_MS = 1000    # periodic loop wake-up to repaint the badge
+ACT_ROWS = 6              # "Activity" strip: max rows (incl. its title) when expanded
+ACTIVITY_IDLE_S = 4       # the strip auto-collapses after this many seconds with no new line
 
 # Control characters forbidden on a display line: a mail subject may contain
 # \n/\r (folded header) or \t, which would push a line down or misalign the
@@ -552,6 +557,17 @@ class App:
         # acct_baseline[name] = "already seen" UIDNEXT → ✚ if UIDNEXT has risen since.
         self.acct_baseline = {}
         self._poll_lock = threading.Lock()
+        # ── Live "Activity" feed (bottom strip) ───────────────────────────
+        # A ring buffer of recent server-action lines (text, level), filled by the
+        # SYNC THREAD and rendered by the main thread in draw_main (which resolves the
+        # level to a curses attr, so NO curses call ever runs off the main thread). It
+        # has its OWN lock (_act_lock), DISTINCT from _poll_lock, so the worker can
+        # append from inside a `with self._poll_lock` section without deadlocking (Lock
+        # is not reentrant). Holds only IMAP phase labels/counts — never any cleartext.
+        self.activity = collections.deque(maxlen=200)
+        self._activity_open = False           # is the strip currently shown?
+        self._activity_last = 0.0             # monotonic ts of the last appended line
+        self._act_lock = threading.Lock()
         self._poll_stop = threading.Event()
         self._poll_thread = None
         # ── IMAP connection pool (main thread): one per account, kept open and
@@ -644,10 +660,14 @@ class App:
                 "wizard, or edit ~/freyja-mail/accounts.toml (see accounts.toml.example)."))
         self._open_cache()      # open/decrypt the cache (after unlocking the vault)
         self.load_folders()
-        self.refresh_list()
-        self._verbose_check("INBOX", full=False)   # verbose check at startup
+        self.refresh_list()     # INSTANT: paints the cached list at t0 (no network)
         self.list.home()        # focus on the MOST RECENT message (top of list)
-        self._start_sync()      # then continuous background sync (5 min + on demand)
+        # No blocking startup check: the cached list is interactive immediately. The
+        # background sync thread runs its first network pass right away (its wakeable
+        # wait is at the END of the loop) and streams progress into the Activity strip;
+        # an unreachable account can no longer stall the launch. Keys n/N still run the
+        # verbose foreground check on demand.
+        self._start_sync()      # continuous background sync (immediate first pass, then 5 min + on demand)
         try:
             self.main_loop()
         finally:
@@ -819,6 +839,8 @@ class App:
             self.status = _("cache unreadable (rebuilt): ") + str(e)[:50]
             self._unlink_db_set(work)
         self.store = fmail_store.Store(work)
+        if not self.status:                  # lower priority than the on-disk-now warnings above
+            self.status = fmail.swap_warning() or ""
         self._cache_closed = False        # the sync thread can write again
 
     def _close_cache(self):
@@ -999,7 +1021,8 @@ class App:
         (_("Move to trash"), "d"), (_("Move…"), "M"), (_("Undo last move"), "z"),
         (_("Select / unselect (bulk)"), " "), (_("Mark read / unread"), "x"),
         (_("Search"), "/"), (_("Filter unread"), "u"),
-        (_("Check for new mail"), "n"), (_("Address book"), "C"),
+        (_("Check for new mail"), "n"), (_("Check all accounts"), "N"),
+        (_("Address book"), "C"),
         (_("⚙ Configuration ▸"), "__config__"),
         (_("General help"), "?"),
         (_("🔒 Encryption help (exchange secure mail)"), "H"),
@@ -1007,7 +1030,7 @@ class App:
     ]
     MENU_CONFIG = [
         (_("Account signature"), "s"), (_("Switch account"), "A"),
-        (_("Add an account"), "N"), (_("Update fmail…"), "__update__"),
+        (_("Add an account"), "__newacct__"), (_("Update fmail…"), "__update__"),
         (_("Uninstall fmail…"), "__uninstall__"), (_("‹ Back"), "__back__"),
     ]
 
@@ -1066,11 +1089,14 @@ class App:
 
     def _do_relock(self):
         """Idle re-lock WITHOUT leaving cleartext: re-encrypt + erase the /dev/shm
-        cache BEFORE erasing the DEK (otherwise encrypt_cache would raise VaultLocked
+        cache BEFORE dropping the DEK (otherwise encrypt_cache would raise VaultLocked
         and the cleartext would remain), blanks the screen, asks for the master
         password, then re-opens the decrypted cache."""
-        self._close_cache()                 # re-encrypt + erase the cleartext (DEK still present)
-        vault.lock()                        # then only: erase the DEK from RAM
+        self._close_cache()                 # re-encrypt + erase the cleartext FILE (DEK still present)
+        vault.lock()                        # then only: drop the DEK reference (NOT a RAM scrub — see vault.lock)
+        with self._act_lock:                # no stale activity lines behind the lock screen
+            self.activity.clear()
+            self._activity_open = False
         try:
             self.stdscr.erase()             # does not expose the decrypted content behind the prompt
             self.stdscr.refresh()
@@ -1100,6 +1126,12 @@ class App:
         k = self._getkey()
         self.stdscr.timeout(-1)
         if k is None or k == curses.KEY_RESIZE:
+            # Auto-collapse the Activity strip after a quiet spell: the layout snaps back
+            # to the two-pane view; the next worker line flips it open again.
+            with self._act_lock:
+                if (self._activity_open
+                        and time.monotonic() - self._activity_last > ACTIVITY_IDLE_S):
+                    self._activity_open = False
             if self._dirty:           # the sync thread filled the cache
                 self._dirty = False
                 self._relist()
@@ -1369,6 +1401,8 @@ class App:
         elif k == "A":
             self._account_picker()
         elif k == "N":
+            self._verbose_check_all()
+        elif k == "__newacct__":
             self._new_account_flow()
         elif k == "C":
             self._address_book()
@@ -1382,12 +1416,21 @@ class App:
             return self._uninstall_flow()
         return None
 
-    # ── 2-column rendering ────────────────────────────────────────────────
+    # ── 2-column rendering (+ optional bottom Activity strip) ─────────────
     def draw_main(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
         fw = max(18, min(28, w // 4))
-        body_top, body_bot = 1, h - 3
+        # Activity strip (bottom): snapshot under its OWN lock, then carve its height
+        # out of the body. act_h=0 reproduces today's exact two-pane layout (tiny
+        # terminals included). When shown, the strip occupies rows h-2-act_h … h-3
+        # (one title row + act_h-1 lines), just above the status line (h-2) and menu (h-1).
+        with self._act_lock:
+            act_open, act_lines = self._activity_open, list(self.activity)
+        act_h = min(ACT_ROWS, max(0, (h - 5) // 2)) if act_open else 0
+        if act_h < 2:
+            act_h = 0            # need room for a title + ≥1 line, else don't show the strip
+        body_top, body_bot = 1, h - 3 - act_h
         pane_h = max(1, body_bot - body_top + 1)
 
         self._bar(0, f" fmail {fmail.__version__} · {self.acc.name}  ({self.acc.email})",
@@ -1498,6 +1541,16 @@ class App:
                         else self._cp(C_TITLE) if not s.seen else self._cp(C_DIM))
                 attr = base | (curses.A_BOLD if not s.seen else 0)
             self._put(body_top + 1 + i, mx, line[:mw], attr)
+
+        # Activity strip: full-width title row + the most recent lines. We slice to the
+        # rows actually available (act_h-1), NOT ACT_ROWS-1, so a short strip never
+        # overflows. _put already width-truncates and guards 0<=y<h.
+        if act_h > 0:
+            self._bar(h - 2 - act_h, _(" ⟩⟩ Server activity"),
+                      self._cp(C_TITLE) | curses.A_BOLD | curses.A_REVERSE)
+            shown = act_lines[-(act_h - 1):]
+            for j, (text, level) in enumerate(shown):
+                self._put(h - 2 - act_h + 1 + j, 0, text, self._lvl_attr(level))
 
         if self.status:
             self._put(h - 2, 0, (" " + self.status)[:w - 1], self._cp(C_WARN))
@@ -2624,7 +2677,8 @@ class App:
                     # A background pass must NEVER crash this daemon thread nor dump a
                     # traceback over the curses UI (it would garble the screen while the
                     # app keeps running). Record it discreetly and keep polling.
-                    self.poll_error = str(e)
+                    with self._poll_lock:        # same discipline as every other poll_error write
+                        self.poll_error = str(e)
                 self._sync_wake.wait(POLL_INTERVAL_S)
                 self._sync_wake.clear()
         finally:
@@ -2667,18 +2721,41 @@ class App:
         if key in self._synced and n >= 6:        # 6 × 5 min ≈ 30 min
             self._full_next.add(key)
         full = key in self._full_next or key not in self._synced
+
+        def _progress(phase, done, total):
+            # CRITICAL (do not drop): still set _dirty — it is the ONLY trigger for live
+            # list population during a sync; a big first sync would otherwise look frozen.
+            # _dirty coalesces (a bool): _main_iter relists at most once per 1s tick.
+            self._dirty = True
+            # …and stream a terse line into the Activity strip. _activity uses its own
+            # _act_lock (≠ _poll_lock), so it is safe even though progress fires while we
+            # hold _sync_lock. Intermediate "new" ticks are skipped to avoid spamming.
+            if phase == "search":
+                self._activity(_("[{acc}] querying server (SEARCH ALL)…", acc=accname))
+            elif phase == "diff":
+                self._activity(_("[{acc}] diff: {new} new, {deleted} deleted",
+                                 acc=accname, new=done, deleted=total),
+                               "ok" if (done or total) else "info")
+            elif phase == "new" and total and done == 0:
+                self._activity(_("[{acc}] fetching {n} header(s)…", acc=accname, n=total))
+            elif phase == "new" and total and done >= total:
+                self._activity(_("[{acc}] {n} header(s) fetched", acc=accname, n=done), "ok")
+            elif phase == "flags" and total:
+                self._activity(_("[{acc}] reconciling flags ({n})…", acc=accname, n=total))
+
         try:
             M = self._sync_conn(accname)
             with self._sync_lock:   # never two concurrent sync_folder on the Store
                 if self._cache_closed or self.store is None:
                     return          # vault re-locked: NEVER rewrite cleartext
                 fmail_store.sync_folder(M, self.store, accname, folder, full=full,
-                                        progress=lambda *_: setattr(self, "_dirty", True),
-                                        flag_guard=self._flag_lock)
+                                        progress=_progress, flag_guard=self._flag_lock)
         except NET_ERRORS as e:
             with self._poll_lock:
                 self.poll_error = str(e)
             self._sync_conns.pop(accname, None)
+            # OUTSIDE the _poll_lock block (independent _act_lock — no nesting).
+            self._activity(_("[{acc}] sync error: {e}", acc=accname, e=str(e)[:60]), "error")
             return
         self._synced.add(key)
         self._full_next.discard(key)
@@ -2736,6 +2813,7 @@ class App:
                 with self._poll_lock:
                     st = self.acct_status.setdefault(name, {})
                     st["error"] = True
+                self._activity(_("[{acc}] STATUS failed", acc=name), "warn")
                 continue
             if typ != "OK" or not data or not data[0]:
                 continue
@@ -2750,6 +2828,8 @@ class App:
                     new = uidnext > base
                 self.acct_status[name] = {"unseen": unseen, "uidnext": uidnext,
                                           "new": new, "error": False}
+            # OUTSIDE the _poll_lock block (independent _act_lock — no nesting).
+            self._activity(_("[{acc}] STATUS INBOX — OK ({n} unread)", acc=name, n=unseen), "ok")
         self._dirty = True
 
     def _ack_account(self, name):
@@ -2796,15 +2876,19 @@ class App:
             except curses.error:
                 pass
 
-    def _verbose_check(self, folder=None, full=True, title=None):
-        """Syncs the folder in the FOREGROUND while showing a verbose log (connection,
-        TLS+certificate, SEARCH, diff, fetch, flags). Under _sync_lock so it never
-        crosses the background sync thread on the Store."""
+    def _verbose_check_one(self, acc, folder, full, title, block_on_fail=True):
+        """Foreground verbose check of ONE account/folder, in its OWN popup window
+        (connection, TLS+certificate, SEARCH, diff, fetch, flags). Under _sync_lock so
+        it never crosses the background sync thread on the Store. Returns True on
+        success. Does NOT relist/ack — the caller finalizes (single vs all-accounts).
+
+        block_on_fail: on failure, wait for a keypress (True) or auto-dismiss after a
+        few seconds (False). The all-accounts sweep uses False so one unreachable
+        account can't stall the others — and, since the startup sweep runs OUTSIDE the
+        main loop's _IdleLock handler, a bounded wait (which disarms the idle-lock via
+        _raw_key) keeps a startup failure from escaping uncaught or hanging."""
         import time as _t
-        if title is None:
-            title = _("⟩⟩ MAIL CHECK")
-        folder = folder or self.folder or "INBOX"
-        acc = self.acc
+        folder = folder or "INBOX"
         t0 = _t.time()
         log = []
 
@@ -2827,10 +2911,12 @@ class App:
 
         try:
             step(_("IMAP connection {host}:{port} (SSL/TLS)", host=acc.imap_host, port=acc.imap_port))
-            with self._imap() as M:
+            with self._imap(acc) as M:
                 fmail._report_tls(getattr(M, "sock", None), acc.imap_host, acc.imap_port, step)
                 step(_("selecting folder \"{folder}\"", folder=folder.replace('INBOX.', '')))
                 with self._sync_lock:
+                    if self._cache_closed or self.store is None:
+                        return False    # vault re-locked: NEVER rewrite cleartext
                     stats = fmail_store.sync_folder(M, self.store, acc.name, folder,
                                                     full=full, progress=progress,
                                                     flag_guard=self._flag_lock)
@@ -2841,13 +2927,47 @@ class App:
                         new=stats.new, deleted=stats.deleted), self._lvl_attr("ok")))
             self._popup_box(title + _(" — OK"), log, footer=_("(Enter, or closes by itself)"))
             self._wait_key_or_timeout(1500)   # auto-dismiss on success (quick read)
+            return True
         except NET_ERRORS as e:
             log.append((f"[{_t.time() - t0:5.2f}s] " + _("✗ FAILED: {e}", e=e), self._lvl_attr("error")))
-            self._popup_box(title + _(" — FAILED"), log, footer=_("[Enter] close"))
-            self._wait_key()
+            if block_on_fail:
+                self._popup_box(title + _(" — FAILED"), log, footer=_("[Enter] close"))
+                self._wait_key()
+            else:
+                self._popup_box(title + _(" — FAILED"), log, footer=_("(Enter, or closes by itself)"))
+                self._wait_key_or_timeout(4000)   # read the error, but never stall the sweep
+            return False
+
+    def _verbose_check(self, folder=None, full=True, title=None):
+        """`n` — verbose foreground check of the displayed folder, current account only."""
+        if title is None:
+            title = _("⟩⟩ MAIL CHECK")
+        folder = folder or self.folder or "INBOX"
+        self._verbose_check_one(self.acc, folder, full, title)
         self._dirty = False
         self._relist()
         if folder == "INBOX" and not self.search_query and not self.only_unseen:
+            self._ack_new()
+
+    def _verbose_check_all(self, full=True):
+        """`N` / startup — verbose check of EVERY account's INBOX, one SEPARATE window
+        per account, run sequentially (imaplib connections and the Store sync are
+        serialized, so a true simultaneous run isn't possible — nor needed). `n` stays
+        single-account, current folder (_verbose_check)."""
+        names = list(self.accounts)
+        n = len(names)
+        for i, name in enumerate(names, 1):
+            acc = self.accounts[name]
+            # Always INBOX (the "new mail" target), even with a single account, so `N`
+            # keeps a single, predictable meaning. The [i/n] counter is dropped when
+            # there's only one account.
+            title = (_("⟩⟩ MAIL CHECK [{i}/{n}] — {acc}", i=i, n=n, acc=acc.name)
+                     if n > 1 else _("⟩⟩ MAIL CHECK"))
+            self._verbose_check_one(acc, "INBOX", full, title, block_on_fail=False)
+            self._ack_account(name)   # we just looked at this INBOX → drop its ✚ badge
+        self._dirty = False
+        self._relist()
+        if self.folder == "INBOX" and not self.search_query and not self.only_unseen:
             self._ack_new()
 
     def _dec_unseen(self, folder):
@@ -3853,7 +3973,7 @@ class App:
         intro = [
             _("No mail account is configured yet."), "",
             _("Let's add your first account (IMAP/SMTP)."),
-            _("You can add more later with the “N” key, or edit accounts.toml by hand."),
+            _("You can add more later via the menu (m → ⚙ Configuration), or edit accounts.toml by hand."),
         ]
         if self._wizard_yesno(_(" Add a mail account"), intro,
                               _("Add an account now?  [Y/n]   (Esc: skip)")) is not True:
@@ -4096,6 +4216,27 @@ class App:
             "error": self._cp(C_ERR) | curses.A_BOLD,
         }.get(level, self._cp(C_ACCENT))
 
+    def _activity(self, text, level="info"):
+        """Appends one timestamped line to the live Activity feed (bottom strip).
+        Called from the SYNC THREAD; draw_main renders it on the next 1s tick. Uses the
+        dedicated _act_lock (NOT _poll_lock), so it is safe to call from inside a
+        `with self._poll_lock` section. Stores (text, LEVEL) — never a curses attr — so
+        NO curses call (color_pair) ever happens off the main thread; draw_main resolves
+        the colour via _lvl_attr when it paints. Builds the line BEFORE locking; the
+        critical section is O(1). Does NOT set self._dirty (that flag is for cache
+        changes; the periodic tick repaints the strip anyway). The buffer holds only
+        IMAP phase labels/counts — never cleartext.
+
+        No-ops while the vault is re-locked (_cache_closed) so the strip stays empty
+        behind the lock screen and the _do_relock clear holds until unlock."""
+        if self._cache_closed:
+            return
+        line = (f"[{time.strftime('%H:%M:%S')}] {text}", level)
+        with self._act_lock:
+            self.activity.append(line)
+            self._activity_open = True
+            self._activity_last = time.monotonic()
+
     def _popup_box(self, title, lines, footer=""):
         """Framed, centered modal window (terminal/phosphor style). Each line can be a
         str (default color) or a (text, attr) pair to color it (e.g. an alert in red).
@@ -4330,7 +4471,8 @@ class App:
             "  x             mark read / unread\n"
             "  C             address book (contacts)\n"
             "  / u           search · filter unread\n"
-            "  n             check for new mail (silent auto-poll every 5 min)\n"
+            "  n             check for new mail — current account (auto-poll every 5 min)\n"
+            "  N             check ALL accounts (one verbose window per account)\n"
             "  g             go to the accounts/folders pane\n"
             "  In a mail:    s save attachments · v verify a changed key\n\n"
             "Multi-selection (mail list)\n"
@@ -4340,7 +4482,7 @@ class App:
             "Configuration (menu m → ⚙, or direct shortcuts)\n"
             "  s             edit the account signature\n"
             "  A             switch account\n"
-            "  N             add a new account\n\n"
+            "  (menu)        add an account (m → ⚙ Configuration)\n\n"
             "Editing (compose)\n"
             "  Tab           next field   (Shift+Tab: previous)\n"
             "  ^E            encryption: auto → forced → off\n"
