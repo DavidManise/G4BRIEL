@@ -102,6 +102,16 @@ CATALOG = {
     "  contacts: {n}": "  contacts : {n}",
     "  master_password active in the config: {active}":
         "  master_password actif dans la config : {active}",
+    "  ⚠ cleartext password files still present (vault BYPASSABLE):":
+        "  ⚠ fichiers de mot de passe en clair encore présents (coffre CONTOURNABLE) :",
+    "  → close the breach:  fmail vault purge-secrets":
+        "  → colmate la brèche :  fmail vault purge-secrets",
+    "  ✓ no cleartext password file (the vault is the only source).":
+        "  ✓ aucun fichier de mot de passe en clair (le coffre est l'unique source).",
+    "master_password is on, but {n} cleartext password file(s) still "
+    "exist — the vault is bypassable. Close it: fmail vault purge-secrets":
+        "master_password est actif, mais {n} fichier(s) de mot de passe en clair "
+        "subsiste(nt) — le coffre est contournable. Colmate : fmail vault purge-secrets",
     "no vault. “fmail vault init” first.": "aucun coffre. « fmail vault init » d'abord.",
     "Current master password: ": "Mot de passe maître actuel : ",
     "New master password": "Nouveau mot de passe maître",

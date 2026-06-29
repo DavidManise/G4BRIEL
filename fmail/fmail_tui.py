@@ -525,6 +525,7 @@ class App:
         self.sec = sec or fmail.load_security()
         self.folder = "INBOX"
         self.summaries = []
+        self._recip_view = False   # current folder is "sent"-side → list shows recipients
         self.list = ListModel(height=10)
         self.status = ""
         self.search_query = ""
@@ -957,6 +958,7 @@ class App:
         uids = self.search_uids if self.search_query else None
         self.summaries = self.store.get_summaries(
             self.acc.name, self.folder, self.search_query, self.only_unseen, uids=uids)
+        self._recip_view = self._is_recipient_folder()
         self._cur_counts = self.store.counts(self.acc.name, self.folder)
         self.list.set_items(self.summaries)
         if keep_uid is not None:
@@ -1273,6 +1275,12 @@ class App:
     def _is_drafts(self):
         return bool(self.folder) and self.folder == self._special("drafts")
 
+    def _is_recipient_folder(self):
+        """Sent/Drafts: the sender is always us, so the recipient is the useful column."""
+        if not self.folder or self.folder == "INBOX":
+            return False                   # the common case: no special-folder lookup
+        return self.folder in (self._special("sent"), self._special("drafts"))
+
     def _edit_draft(self, summary):
         """Opens a draft in the editor; on save/send, the old one is replaced."""
         try:
@@ -1523,9 +1531,11 @@ class App:
             dot = "●" if not s.seen else " "
             lk = "🔒" if s.encrypted else "  "   # lock if encrypted (PGP/MIME)
             # date + time (date_fmt = "YYYY-MM-DD HH:MM"); fixed width for alignment.
-            # The sender column widens on roomy panes (≥96 cols), staying 16 on narrow ones.
+            # The who column widens on roomy panes (≥96 cols), staying 16 on narrow ones.
+            # "Sent"-side folders show the recipient ("→ …") instead of the always-self sender.
             fw = 16 if mw < 96 else min(28, max(16, mw // 4))
-            line = f"{mk}{dot}{lk} {s.date_fmt[:16]:<16} {s.from_display[:fw]:<{fw}} {s.subject or _('(no subject)')}"
+            who = ("→ " + (s.to_display or s.from_display)) if self._recip_view else s.from_display
+            line = f"{mk}{dot}{lk} {s.date_fmt[:16]:<16} {who[:fw]:<{fw}} {s.subject or _('(no subject)')}"
             is_sel = (idx == self.list.cursor)
             if is_sel and self.focus == "mails":
                 attr = curses.A_REVERSE | curses.A_BOLD

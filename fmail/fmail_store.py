@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from email.utils import parsedate_to_datetime, parseaddr
 
 import fmail
-from fmail import Summary, decode_field, _imap_quote
+from fmail import Summary, decode_field, format_recipients, _imap_quote
 from i18n import _
 
 
@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS messages (
     sort_key      INTEGER,          -- epoch (INTERNALDATE) for sorting
     from_display  TEXT,
     from_addr     TEXT,
+    to_display    TEXT,             -- compact recipient (To); NULL = not fetched yet
     subject       TEXT,
     raw           BLOB,             -- full message, NULL until opened
     raw_at        REAL,
@@ -99,6 +100,10 @@ class Store:
             cols = {r[1] for r in self._db.execute("PRAGMA table_info(messages)")}
             if "encrypted" not in cols:
                 self._db.execute("ALTER TABLE messages ADD COLUMN encrypted INTEGER")
+            # Migration: "to_display" column (recipient shown in "sent"-side folders).
+            # Stays NULL on legacy rows → a bounded sync backfill fills them in.
+            if "to_display" not in cols:
+                self._db.execute("ALTER TABLE messages ADD COLUMN to_display TEXT")
             self._db.commit()
         self._secure()
 
@@ -146,8 +151,8 @@ class Store:
 
     # ── Reading messages (for the TUI) ───────────────────────────────────
     def get_summaries(self, account, folder, search="", only_unseen=False, limit=None, uids=None):
-        q = ("SELECT uid, date_fmt, from_display, subject, seen, encrypted FROM messages "
-             "WHERE account=? AND folder=?")
+        q = ("SELECT uid, date_fmt, from_display, to_display, subject, seen, encrypted "
+             "FROM messages WHERE account=? AND folder=?")
         args = [account, folder]
         if only_unseen:
             q += " AND seen=0"
@@ -166,9 +171,9 @@ class Store:
             # "no_reply" would over-match). Escape "\" first.
             esc = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             q += (" AND (subject LIKE ? ESCAPE '\\' OR from_display LIKE ? ESCAPE '\\' "
-                  "OR from_addr LIKE ? ESCAPE '\\')")
+                  "OR from_addr LIKE ? ESCAPE '\\' OR to_display LIKE ? ESCAPE '\\')")
             pat = f"%{esc}%"
-            args += [pat, pat, pat]
+            args += [pat, pat, pat, pat]
         q += " ORDER BY sort_key DESC, uid DESC"
         if limit:
             q += f" LIMIT {int(limit)}"
@@ -176,6 +181,7 @@ class Store:
             rows = self._db.execute(q, args).fetchall()
         return [Summary(uid=str(r["uid"]), date_fmt=r["date_fmt"] or "",
                         from_display=r["from_display"] or "(?)",
+                        to_display=r["to_display"] or "",
                         subject=r["subject"] or "", seen=bool(r["seen"]),
                         encrypted=(None if r["encrypted"] is None else bool(r["encrypted"])))
                 for r in rows]
@@ -211,15 +217,16 @@ class Store:
     # ── Writes (sync thread + TUI actions) ───────────────────────────────
     def upsert_messages(self, account, folder, rows):
         """rows: list of dicts {uid, seen, answered, flagged, date_fmt, sort_key,
-        from_display, from_addr, subject, encrypted}. Does NOT overwrite the body (raw)."""
+        from_display, from_addr, to_display, subject, encrypted}. Does NOT overwrite
+        the body (raw)."""
         if not rows:
             return
         with self._lock:
             self._db.executemany(
                 "INSERT INTO messages (account, folder, uid, seen, answered, flagged, "
-                " date_fmt, sort_key, from_display, from_addr, subject, encrypted) "
+                " date_fmt, sort_key, from_display, from_addr, to_display, subject, encrypted) "
                 "VALUES (:account,:folder,:uid,:seen,:answered,:flagged,"
-                " :date_fmt,:sort_key,:from_display,:from_addr,:subject,:encrypted) "
+                " :date_fmt,:sort_key,:from_display,:from_addr,:to_display,:subject,:encrypted) "
                 "ON CONFLICT(account, folder, uid) DO UPDATE SET "
                 " seen=excluded.seen, answered=excluded.answered, flagged=excluded.flagged, "
                 " encrypted=excluded.encrypted",
@@ -253,6 +260,27 @@ class Store:
                 "ORDER BY sort_key DESC, uid DESC LIMIT ?",
                 (account, folder, int(limit))).fetchall()
         return [r["uid"] for r in rows]
+
+    def uids_without_recipient(self, account, folder, limit):
+        """UIDs whose recipient has not been fetched yet (to_display IS NULL), most
+        recent first — bounded backfill of legacy rows for the "sent"-side display.
+        A message genuinely without a To gets "" on backfill, so it is not re-fetched."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT uid FROM messages WHERE account=? AND folder=? AND to_display IS NULL "
+                "ORDER BY sort_key DESC, uid DESC LIMIT ?",
+                (account, folder, int(limit))).fetchall()
+        return [r["uid"] for r in rows]
+
+    def set_recipient_bulk(self, account, folder, pairs):
+        """pairs: list of (uid, to_display) — bulk backfill of the recipient column."""
+        if not pairs:
+            return
+        with self._lock:
+            self._db.executemany(
+                "UPDATE messages SET to_display=? WHERE account=? AND folder=? AND uid=?",
+                [(td, account, folder, u) for (u, td) in pairs])
+            self._db.commit()
 
     def update_flags_bulk(self, account, folder, flagrows):
         """flagrows: list of (uid, seen, answered, flagged)."""
@@ -364,6 +392,7 @@ def _parse_meta_response(md):
         rows.append({"uid": uid, "seen": seen, "answered": answered, "flagged": flagged,
                      "date_fmt": date_fmt, "sort_key": sort_key,
                      "from_display": name or addr or "(?)", "from_addr": addr,
+                     "to_display": format_recipients(msg.get("To")),
                      "subject": decode_field(msg.get("Subject")),
                      "encrypted": _ct_encrypted(msg.get("Content-Type"))})
     return rows
@@ -398,7 +427,7 @@ def _fetch_meta(M, uids):
         uid_set = ",".join(str(u) for u in chunk).encode()
         typ, md = M.uid("fetch", uid_set,
                         "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS "
-                        "(FROM SUBJECT DATE CONTENT-TYPE)])")
+                        "(FROM TO SUBJECT DATE CONTENT-TYPE)])")
         if typ == "OK" and md:
             rows += _parse_meta_response(md)
     return rows
@@ -422,6 +451,26 @@ def _fetch_crypto_flags(M, uids):
                 continue
             msg = email.message_from_string((item[1] or b"").decode(errors="replace"))
             out.append((int(mu.group(1)), _ct_encrypted(msg.get("Content-Type"))))
+    return out
+
+
+def _fetch_recipients(M, uids):
+    """(uid, to_display) fetching only the To header — lightweight, to backfill the
+    recipient of already-cached (legacy) messages for the "sent"-side display."""
+    out = []
+    for chunk in _chunks(uids, 500):
+        uid_set = ",".join(str(u) for u in chunk).encode()
+        typ, md = M.uid("fetch", uid_set, "(UID BODY.PEEK[HEADER.FIELDS (TO)])")
+        if typ != "OK" or not md:
+            continue
+        for i, item in enumerate(md):
+            if not (isinstance(item, tuple) and len(item) >= 2):
+                continue
+            mu = _UID_RE.search(item[0] or b"")
+            if not mu:
+                continue
+            msg = email.message_from_string((item[1] or b"").decode(errors="replace"))
+            out.append((int(mu.group(1)), format_recipients(msg.get("To"))))
     return out
 
 
@@ -542,6 +591,13 @@ def sync_folder(M, store, account, folder, window=2000, full=False, progress=Non
         if progress:
             progress("crypto", 0, len(unprobed))
         store.set_encrypted_bulk(account, folder, _fetch_crypto_flags(M, unprobed))
+
+    # BOUNDED backfill of the recipient (To) for legacy rows cached before the
+    # to_display column existed (to_display IS NULL). New messages already carry it
+    # from _fetch_meta; this self-heals old caches over a few passes, then goes idle.
+    no_recip = store.uids_without_recipient(account, folder, 800)
+    if no_recip:
+        store.set_recipient_bulk(account, folder, _fetch_recipients(M, no_recip))
 
     store.set_folder_state(account, folder, uidvalidity, uidnext, time.time())
     return stats

@@ -52,7 +52,7 @@ from email.utils import (formataddr, formatdate, getaddresses, make_msgid,
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.9.5-beta"
+__version__ = "0.9.6-beta"
 
 CONFIG_PATH = Path(os.environ.get("FMAIL_CONFIG", Path.home() / "freyja-mail" / "accounts.toml"))
 STATE_PATH = Path.home() / "freyja-mail" / ".fmail_state.json"
@@ -78,6 +78,12 @@ def err(msg: str) -> None:
     if not msg:               # empty = silent (e.g. the duress quit leaves no trace)
         return
     print(c(f"✗ {msg}", "31"), file=sys.stderr)
+
+
+def warn(msg: str) -> None:
+    """Non-fatal warning → stderr (so it never pollutes a piped stdout listing)."""
+    if msg:
+        print(c(f"⚠ {msg}", "1;33"), file=sys.stderr)
 
 
 class FmailError(Exception):
@@ -277,6 +283,30 @@ def load_security() -> Security:
     )
 
 
+def leftover_cleartext_secrets(accounts: dict) -> list[Path]:
+    """Cleartext password_file(s) that STILL exist while the encrypted vault is meant
+    to be the source (master_password on + vault present). Their mere existence makes
+    the vault bypassable: anything running as this user — or anyone who steals the
+    disk — can read the IMAP password in cleartext and connect, master password or
+    not. Deduplicated by resolved path. Empty list = nothing to purge.
+    Closing the breach = “fmail vault purge-secrets” (deletes them once they are in
+    the vault). This helper only *reports*; it never reads or deletes anything."""
+    if not (load_security().master_password and vault.exists()):
+        return []
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for acc in accounts.values():
+        if not acc.password_file:
+            continue
+        p = Path(os.path.expanduser(acc.password_file)).resolve()
+        if p in seen:
+            continue
+        seen.add(p)
+        if p.exists():
+            out.append(p)
+    return out
+
+
 def load_ui() -> dict:
     """The config's [ui] table (interface settings: lang, splash…). {} if absent."""
     try:
@@ -426,6 +456,14 @@ def cmd_vault(args, accounts, default) -> None:
         print(_("  accounts in the vault: {accounts}", accounts=accs))
         print(_("  contacts: {n}", n=len(d.get('contacts', []))))
         print(_("  master_password active in the config: {active}", active=load_security().master_password))
+        leftover = leftover_cleartext_secrets(accounts)
+        if leftover:
+            print(c(_("  ⚠ cleartext password files still present (vault BYPASSABLE):"), "1;33"))
+            for p in leftover:
+                print(f"       {p}")
+            print(c(_("  → close the breach:  fmail vault purge-secrets"), "33"))
+        else:
+            print(c(_("  ✓ no cleartext password file (the vault is the only source)."), "1;32"))
         return
 
     if action == "passwd":
@@ -715,6 +753,17 @@ def decode_field(raw: str | None) -> str:
         return raw.strip()
 
 
+def format_recipients(raw: str | None) -> str:
+    """Compact display of a To/Cc header for a list view (used for “sent”-side
+    folders, where the recipient is more useful than the always-self sender):
+    the first recipient's name (or address), plus “+N” when there are more.
+    Returns "" when there is no parseable recipient."""
+    names = [n or a for n, a in getaddresses([decode_field(raw)]) if (n or a)]
+    if not names:
+        return ""
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names) - 1}"
+
+
 # ─── IMAP ──────────────────────────────────────────────────────────────────
 
 def imap_connect(acc: Account) -> imaplib.IMAP4_SSL:
@@ -858,6 +907,7 @@ class Summary:
     subject: str
     seen: bool
     encrypted: object = None   # True=PGP/MIME · False=cleartext · None=unknown (not yet probed)
+    to_display: str = ""       # compact recipient, shown instead of the sender in "sent"-side folders
 
 
 def fetch_summaries(M: imaplib.IMAP4_SSL, uids: list[bytes]) -> list[Summary]:
@@ -868,7 +918,7 @@ def fetch_summaries(M: imaplib.IMAP4_SSL, uids: list[bytes]) -> list[Summary]:
     norm = [u.decode() if isinstance(u, (bytes, bytearray)) else str(u) for u in uids]
     uid_set = ",".join(norm).encode()
     typ, md = M.uid("fetch", uid_set,
-                    "(UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+                    "(UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])")
     if typ != "OK" or not md:
         return []
 
@@ -899,6 +949,7 @@ def fetch_summaries(M: imaplib.IMAP4_SSL, uids: list[bytes]) -> list[Summary]:
             from_display=name or addr or _("(?)"),
             subject=decode_field(msg.get("Subject")),
             seen=b"\\Seen" in flags,
+            to_display=format_recipients(msg.get("To")),
         )
     return [by_uid[u] for u in norm if u in by_uid]
 
@@ -1083,7 +1134,8 @@ def resolve_target(args, acc: Account) -> tuple[str, str]:
 
 # ─── Rendering ─────────────────────────────────────────────────────────────────
 
-def render_list(acc: Account, folder: str, summaries: list[Summary]) -> None:
+def render_list(acc: Account, folder: str, summaries: list[Summary],
+                show_recipient: bool = False) -> None:
     n_unseen = sum(1 for s in summaries if not s.seen)
     head = _("{email} · {folder}  ({n} mails, {unseen} unread)",
              email=acc.email, folder=folder, n=len(summaries), unseen=n_unseen)
@@ -1099,7 +1151,10 @@ def render_list(acc: Account, folder: str, summaries: list[Summary]) -> None:
         dot = c("●", "1;32") if not s.seen else " "
         num = c(f"{i:>3}", "1;32")
         when = c(f"{s.date_fmt:<16}", "90")
-        who = c(f"{s.from_display[:24]:<24}", "36")
+        # "sent"-side folders: the sender is always us → show the recipient instead
+        # (prefixed "→ " so it reads clearly as a destination, not an origin).
+        who_text = ("→ " + (s.to_display or s.from_display)) if show_recipient else s.from_display
+        who = c(f"{who_text[:24]:<24}", "36")
         subj = s.subject or _("(no subject)")
         subj = c(subj, "1;37") if not s.seen else c(subj, "90")
         print(f"{num} {dot} {when}  {who}  {subj}")
@@ -1932,6 +1987,15 @@ def cmd_folders(args, accounts, default) -> None:
         imap_logout(M)
 
 
+def _is_sent_side(M: imaplib.IMAP4_SSL, acc: Account, folder: str) -> bool:
+    """True if `folder` is the account's Sent or Drafts folder — those whose sender
+    is always us, so the recipient is the useful column. `M`: open connection."""
+    if not folder or folder.upper() == "INBOX":
+        return False                       # the common case: no special-folder lookup
+    special = detect_special(M, acc)
+    return folder in (special.get("sent"), special.get("drafts"))
+
+
 def cmd_list(args, accounts, default) -> None:
     acc = pick_account(args, accounts, default)
     M = imap_connect(acc)
@@ -1940,9 +2004,10 @@ def cmd_list(args, accounts, default) -> None:
         criteria = ["UNSEEN"] if args.unseen else ["ALL"]
         uids = search_uids(M, criteria, args.limit)
         summaries = fetch_summaries(M, uids)
+        show_recipient = _is_sent_side(M, acc, args.folder)
     finally:
         imap_logout(M)
-    render_list(acc, args.folder, summaries)
+    render_list(acc, args.folder, summaries, show_recipient)
 
 
 def cmd_search(args, accounts, default) -> None:
@@ -1953,9 +2018,10 @@ def cmd_search(args, accounts, default) -> None:
         imap_select(M, args.folder, readonly=True)
         uids = search_text_uids(M, query, args.limit)
         summaries = fetch_summaries(M, uids)
+        show_recipient = _is_sent_side(M, acc, args.folder)
     finally:
         imap_logout(M)
-    render_list(acc, args.folder, summaries)
+    render_list(acc, args.folder, summaries, show_recipient)
 
 
 def cmd_read(args, accounts, default) -> None:
@@ -2310,6 +2376,14 @@ def main() -> int:
             import fmail_tui
             return fmail_tui.run(accounts, default, getattr(args, "account", None), sec)
         accounts, default = load_config()   # CLI commands require a configured account
+        # Security nag: master_password is on but cleartext password files still exist
+        # → the vault is bypassable. "vault" has its own detailed report (skip the dupe).
+        if cmd != "vault":
+            leftover = leftover_cleartext_secrets(accounts)
+            if leftover:
+                warn(_("master_password is on, but {n} cleartext password file(s) still "
+                       "exist — the vault is bypassable. Close it: fmail vault purge-secrets",
+                       n=len(leftover)))
         # CLI commands touching the accounts → unlock the vault if enabled.
         if sec.master_password and vault.exists() and cmd not in _CLI_NO_UNLOCK:
             cli_unlock()
